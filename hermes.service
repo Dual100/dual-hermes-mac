@@ -1,0 +1,96 @@
+[Unit]
+Description=Hermes Agent (DualHermes Gem Hunter)
+After=network-online.target nvidia-proxy.service
+Wants=network-online.target
+Requires=nvidia-proxy.service
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/home/hermes/.hermes/hermes-agent
+Environment="HERMES_HOME=/home/hermes/.hermes"
+Environment="PATH=/home/hermes/.local/bin:/home/hermes/.hermes/hermes-agent/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/hermes/.hermes/.env
+
+ExecStart=/home/hermes/.hermes/hermes-agent/venv/bin/hermes gateway start
+ExecStop=/home/hermes/.hermes/hermes-agent/venv/bin/hermes gateway stop
+
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# ============================================================================
+# Resource limits
+# ============================================================================
+MemoryMax=2G
+MemoryHigh=1.5G
+CPUQuota=200%
+TasksMax=200
+
+# ============================================================================
+# Security hardening — Filesystem
+# ============================================================================
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# Only hermes can write here
+ReadWritePaths=/home/hermes/.hermes
+ReadOnlyPaths=/etc/ssl/certs
+
+# ============================================================================
+# Security hardening — Syscalls
+# ============================================================================
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap
+
+# ============================================================================
+# Security hardening — Capabilities
+# ============================================================================
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# ============================================================================
+# Security hardening — Network egress control
+# ============================================================================
+# Only allow these destinations. Uncomment after verifying hermes works.
+# IPAddressDeny=any
+# IPAddressAllow=127.0.0.1
+# IPAddressAllow=169.254.0.0/16
+# IPAddressAllow=api.telegram.org
+# IPAddressAllow=api.openrouter.ai
+# IPAddressAllow=api.dexscreener.com
+# IPAddressAllow=api.gopluslabs.io
+# IPAddressAllow=sorsa.io
+# IPAddressAllow=api.memory.lol
+# IPAddressAllow=github.com
+# IPAddressAllow=raw.githubusercontent.com
+# IPAddressAllow=pypi.org files.pythonhosted.org
+
+# ============================================================================
+# Logging
+# ============================================================================
+StandardOutput=append:/home/hermes/.hermes/logs/hermes.out
+StandardError=append:/home/hermes/.hermes/logs/hermes.err
+SyslogIdentifier=hermes
+
+[Install]
+WantedBy=multi-user.target

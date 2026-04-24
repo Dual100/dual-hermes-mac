@@ -1,0 +1,131 @@
+# Hermes Agent configuration — DualHermes Gem Hunter
+# Place at /home/hermes/.hermes/config.yaml
+# Reference: https://hermes-agent.nousresearch.com/docs/user-guide/configuration/
+
+# =============================================================================
+# LLM PROVIDER — reuse existing nvidia-proxy (zero extra cost)
+# =============================================================================
+provider:
+  name: openai_compatible
+  base_url: http://127.0.0.1:8000/v1
+  api_key: local-proxy  # nvidia-proxy doesn't check auth
+  model: kimi-k2.5
+  # Alternative: swap to OpenRouter for Hermes 4 70B later
+  # base_url: https://openrouter.ai/api/v1
+  # api_key: ${OPENROUTER_API_KEY}
+  # model: nousresearch/hermes-4-70b
+
+# =============================================================================
+# CHANNELS — Telegram only (no Discord/Slack/Email for v1)
+# =============================================================================
+channels:
+  telegram:
+    enabled: true
+    bot_token: ${HERMES_TELEGRAM_BOT_TOKEN}
+    # Allowlist: ONLY your user_id responds. Others ignored.
+    allow_from:
+      - "750774735"  # user_id do jackson
+    dm_policy: allowlist
+    rate_limit_per_user: 30  # msgs per minute
+
+# =============================================================================
+# TOOLS — whitelist. Explicitly disable dangerous ones.
+# =============================================================================
+tools:
+  # Enable ONLY what we need. No execute_code, no shell, no browser.
+  enabled:
+    - web_search          # safe, via Brave
+    - http_get            # fetching APIs
+    - read_file           # read own memory/skills only (ReadWritePaths)
+    - write_file          # write to ~/.hermes/ only
+    - mcp                 # <-- custom MCP server with our tools
+    - telegram_send       # send alerts
+    - memory              # persistent memory management
+    - schedule            # cron scheduling
+    - delegate_task       # subagents
+
+  disabled:
+    - execute_code        # no arbitrary Python
+    - shell               # no terminal
+    - browser_automation  # no browser (too powerful)
+    - ssh                 # no remote shell
+    - docker              # no container spawning
+    - file_delete_recursive
+
+  # MCP server configuration — our custom tool wrappers
+  mcp_servers:
+    hermes_tools:
+      command: python3
+      args: ["/home/hermes/hermes-tools/mcp_server.py"]
+      env:
+        POSTGRES_DSN: ${POSTGRES_DSN_READONLY}  # read-only user
+        TWEETSCOUT_API_KEY: ${TWEETSCOUT_API_KEY}
+        QUICKNODE_RPC: ${QUICKNODE_RPC}
+        HERMES_TELEGRAM_BOT_TOKEN: ${HERMES_TELEGRAM_BOT_TOKEN}
+
+# =============================================================================
+# MEMORY & SKILLS
+# =============================================================================
+memory:
+  backend: local           # Honcho/Mem0 optional later
+  file: /home/hermes/.hermes/memory.md
+  user_file: /home/hermes/.hermes/user.md
+  max_size_kb: 500
+
+skills:
+  directory: /home/hermes/.hermes/skills
+  auto_generate: true      # learn from successful runs
+  allow_import_external: false  # NEVER import third-party skills
+
+# =============================================================================
+# SUBAGENTS — parallel workers for long-horizon tasks
+# =============================================================================
+subagents:
+  enabled: true
+  max_concurrent: 3
+  timeout_seconds: 300
+  isolated_context: true
+
+# =============================================================================
+# SCHEDULING — cron for autonomous hunts
+# =============================================================================
+schedule:
+  enabled: true
+  jobs:
+    - name: daily_gem_hunt
+      cron: "0 6,12,18 * * *"  # 3x/day at 06:00, 12:00, 18:00 UTC
+      skill: daily_gem_hunt
+      deliver_to: telegram
+
+    - name: telegram_signal_scan
+      cron: "*/15 * * * *"  # every 15 min
+      skill: scan_telegram_signals
+      deliver_to: telegram
+      silent_if_empty: true  # don't spam if no signals
+
+# =============================================================================
+# SAFETY
+# =============================================================================
+safety:
+  approval_required_for:
+    - mass_telegram_send   # require confirmation before bulk messages
+    - skill_modification    # can't self-modify without approval
+
+  rate_limits:
+    llm_calls_per_minute: 60
+    telegram_sends_per_minute: 10
+    http_requests_per_minute: 120
+
+  kill_switch:
+    command: /hermes_stop
+    # Typing this in Telegram stops all processing immediately
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+logging:
+  level: INFO
+  file: /home/hermes/.hermes/logs/hermes.log
+  rotate: daily
+  retain_days: 7
+  redact_secrets: true      # scrub API keys from logs

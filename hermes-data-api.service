@@ -1,0 +1,37 @@
+[Unit]
+Description=Hermes Data API — Read-only feed for Mac Hermes Agent
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/creator-bid-bot
+EnvironmentFile=/home/ubuntu/creator-bid-bot/.env.hermes_api
+ExecStart=/usr/bin/python3 /home/ubuntu/creator-bid-bot/hermes_data_api.py
+
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Resource caps
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=50
+
+# Security hardening (runs as `ubuntu` so less aggressive than Hermes service)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# Logging
+StandardOutput=append:/home/ubuntu/creator-bid-bot/hermes_data_api.out
+StandardError=append:/home/ubuntu/creator-bid-bot/hermes_data_api.err
+
+[Install]
+WantedBy=multi-user.target

@@ -440,10 +440,17 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO hermes_writer;
 
 -- DENY writes to crypto bot's sensitive tables
 -- (wallet_learning, claude_decisions, trades — these are in different schemas usually)
--- If they're in public, explicitly revoke:
-REVOKE INSERT, UPDATE, DELETE ON TABLE
-    -- trade data (if they exist in public schema)
-    -- positions, trades, agent_decisions
-    -- ignore errors if tables don't exist
-    -- wrap in DO block for safety
-    FROM hermes_writer;
+-- If they're in public, explicitly revoke. Wrapped in DO block to ignore missing tables.
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOR t IN SELECT unnest(ARRAY['positions', 'trades', 'agent_decisions',
+                                  'wallet_learning', 'claude_decisions']) LOOP
+        BEGIN
+            EXECUTE format('REVOKE INSERT, UPDATE, DELETE ON TABLE %I FROM hermes_writer', t);
+        EXCEPTION WHEN undefined_table THEN
+            -- table does not exist, skip
+            NULL;
+        END;
+    END LOOP;
+END $$;

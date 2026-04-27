@@ -93,11 +93,42 @@ async def run_telegram_bot() -> None:
         if not context.args:
             await update.message.reply_text("Usage: /hunt 0xabc... or /hunt $TICKER")
             return
-        query = " ".join(context.args)
+        query = " ".join(context.args).strip()
         await update.message.reply_text(f"🔍 Investigating {query}... (≤30s)")
-        # TODO: trigger investigation pipeline
-        # For now, stub
-        await update.message.reply_text("⚠️ Investigation pipeline not wired yet — stub response")
+        try:
+            import aiohttp
+            from pump_forensics import extract_pump_anatomy, _simulate_hermes_decision
+            chain = "ethereum"
+            async with aiohttp.ClientSession() as session:
+                anatomy = await extract_pump_anatomy(query, chain, session)
+            d = anatomy.get("hermes_would_alert") or _simulate_hermes_decision(anatomy)
+
+            sym = anatomy.get("symbol", "?")
+            mcap = anatomy.get("current_mcap", 0)
+            vol = anatomy.get("volume_24h", 0)
+            liq = anatomy.get("liquidity_usd", 0)
+            holders = anatomy.get("holder_count", 0)
+            pct24 = anatomy.get("price_change_24h", 0)
+            pct1 = anatomy.get("price_change_1h", 0)
+            tw = anatomy.get("twitter_handle") or ""
+
+            action_emoji = {"ALERT": "🚨", "WATCH": "👀", "SKIP": "🚫"}.get(d.get("action"), "❓")
+            lines = [
+                f"{action_emoji} <b>{d.get('action')}</b>  score={d.get('score')}/100",
+                "",
+                f"🪙 <b>${sym}</b>  <code>{query}</code>",
+                f"💰 mcap=${mcap:,.0f}  vol24h=${vol:,.0f}  liq=${liq:,.0f}",
+                f"📈 1h={pct1:.1f}%  24h={pct24:.1f}%  holders={holders}",
+                f"🐦 @{tw}" if tw else "🐦 (no twitter)",
+                "",
+                "<b>Reasons:</b>",
+            ]
+            for r in (d.get("reasons") or [])[:10]:
+                lines.append(f"  {r}")
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            logger.exception("hunt failed")
+            await update.message.reply_text(f"❌ Investigation failed: {type(e).__name__}: {e}")
 
     async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await require_auth(update):

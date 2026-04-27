@@ -42,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger("truthsocial")
 
 FEED_URL = "https://trumpstruth.org/feed"
-POLL_INTERVAL = 30  # seconds
+POLL_INTERVAL = 15  # seconds — sweet spot: not rate-limited, near real-time
 SEEN_FILE = "/home/ubuntu/.truthsocial_seen.txt"
 MAX_SEEN = 200  # cap memory of seen IDs
 

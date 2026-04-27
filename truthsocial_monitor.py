@@ -117,6 +117,49 @@ def detect_narratives(text: str) -> List[str]:
     return hits
 
 
+# ─── Cross-reference: search candidate tokens for matching ticker/narrative ──
+async def search_candidate_tokens(session: aiohttp.ClientSession,
+                                    query: str, max_results: int = 5) -> List[Dict]:
+    """DexScreener search → return tokens matching the ticker/narrative.
+
+    Sorted by: liquidity DESC (most liquid first), then age DESC (older first).
+    Older + liquid = the dormant-mega-narrative pattern target.
+    """
+    url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            data = await r.json()
+    except Exception as e:
+        logger.debug(f"DexScreener search failed: {e}")
+        return []
+    pairs = data.get("pairs") or []
+    # Filter: exact symbol match, chain in [eth, base, solana]
+    qu = query.upper().lstrip("$")
+    candidates = []
+    for p in pairs:
+        sym = (p.get("baseToken", {}).get("symbol") or "").upper()
+        chain = p.get("chainId", "")
+        if sym != qu:
+            continue
+        if chain not in ("ethereum", "base", "solana", "bsc"):
+            continue
+        candidates.append({
+            "address": p.get("baseToken", {}).get("address"),
+            "symbol": sym,
+            "name": p.get("baseToken", {}).get("name"),
+            "chain": chain,
+            "mcap": float(p.get("marketCap") or p.get("fdv") or 0),
+            "liquidity": float(p.get("liquidity", {}).get("usd") or 0),
+            "volume_24h": float(p.get("volume", {}).get("h24") or 0),
+            "price_change_24h": float(p.get("priceChange", {}).get("h24") or 0),
+            "pair_created_at": int(p.get("pairCreatedAt", 0)),
+            "url": f"https://dexscreener.com/{chain}/{p.get('baseToken', {}).get('address')}",
+        })
+    # Sort: highest liquidity first; for equal liquidity, oldest first (dormant pattern)
+    candidates.sort(key=lambda c: (-c["liquidity"], c["pair_created_at"]))
+    return candidates[:max_results]
+
+
 def parse_feed(xml_text: str) -> List[Dict]:
     """Returns list of {id, title, text, link, original_url, pub_date}."""
     out = []
@@ -167,6 +210,41 @@ async def alert_post(post: Dict) -> None:
     if hashtags:
         lines.append(f"#️⃣ {' '.join(['#' + h for h in hashtags])}")
 
+    # Build search candidates list (tickers + narrative names if no explicit tickers)
+    search_terms = list(tickers)
+    if not tickers and narratives:
+        search_terms = narratives[:2]  # search top 2 narratives (e.g. "MAGA", "FIGHT")
+
+    # Cross-reference: search DexScreener for matching tokens, run pump_forensics on best
+    auto_match = None
+    async with aiohttp.ClientSession() as s:
+        for term in search_terms[:3]:
+            candidates = await search_candidate_tokens(s, term)
+            if candidates:
+                top = candidates[0]
+                # Run pump_forensics on top candidate (oldest+liquid)
+                try:
+                    from pump_forensics import extract_pump_anatomy, _simulate_hermes_decision
+                    anatomy = await extract_pump_anatomy(top["address"], top["chain"], s)
+                    decision = anatomy.get("hermes_would_alert") or _simulate_hermes_decision(anatomy)
+                    auto_match = {"term": term, "candidate": top, "decision": decision}
+                    break
+                except Exception as e:
+                    logger.debug(f"pump_forensics failed for {top['address']}: {e}")
+
+    if auto_match:
+        c = auto_match["candidate"]
+        d = auto_match["decision"]
+        action_emoji = {"ALERT": "🚨", "WATCH": "👀", "SKIP": "🚫"}.get(d.get("action"), "❓")
+        lines.append("")
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"🤖 <b>AUTO-MATCH</b> for '{auto_match['term']}'")
+        lines.append(f"{action_emoji} <b>{d.get('action')}</b> score={d.get('score')}/100")
+        lines.append(f"🪙 <b>${c['symbol']}</b> ({c['chain']})")
+        lines.append(f"<code>{c['address']}</code>")
+        lines.append(f"💰 mcap=${c['mcap']:,.0f}  liq=${c['liquidity']:,.0f}  vol24h=${c['volume_24h']:,.0f}")
+        lines.append(f"📈 24h: {c['price_change_24h']:.1f}%")
+
     lines.append("")
     lines.append(f"⏰ {post.get('pub_date', '')}")
     if post.get("original_url"):
@@ -175,8 +253,19 @@ async def alert_post(post: Dict) -> None:
     msg = "\n".join(filter(None, lines))
 
     keyboard = None
-    if tickers:
-        # Quick search button for first ticker
+    if auto_match:
+        c = auto_match["candidate"]
+        addr_l = c["address"].lower()
+        keyboard = {"inline_keyboard": [
+            [
+                {"text": "Fred", "url": f"https://t.me/alertfriendbot?start={addr_l}"},
+                {"text": "📈 DexScreener", "url": c["url"]},
+            ],
+            [
+                {"text": "🔍 Truth Social", "url": post.get("original_url", FEED_URL)},
+            ],
+        ]}
+    elif tickers:
         keyboard = {"inline_keyboard": [[
             {"text": f"📈 ${tickers[0]} on DexScreener",
              "url": f"https://dexscreener.com/search?q=${tickers[0]}"},

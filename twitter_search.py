@@ -166,13 +166,11 @@ async def search_sorsa(
 
     url = f"{SORSA_BASE}/search-tweets"
     headers = {"ApiKey": SORSA_API_KEY, "Content-Type": "application/json"}
-    payload = {"query": query, "limit": min(count, 50)}
+    payload = {"query": query, "order": "latest"}
 
     try:
         async with session.post(url, json=payload, headers=headers,
                                  timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 404:
-                return await search_sorsa_v2(query, session, count)
             if resp.status == 429:
                 return {"error": "sorsa_rate_limit"}
             if resp.status != 200:
@@ -206,39 +204,6 @@ async def search_sorsa(
         "mentions": mentions,
         "total_found": len(mentions),
         "next_cursor": data.get("next_cursor") if isinstance(data, dict) else None,
-    }
-
-
-async def search_sorsa_v2(
-    query: str, session: aiohttp.ClientSession, count: int
-) -> Dict[str, Any]:
-    """Fallback to v2 search-tweets endpoint (known to work from dead_code)."""
-    url = "https://api.sorsa.io/v2/search-tweets"
-    params = {"query": query, "limit": count}
-    headers = {"ApiKey": SORSA_API_KEY}
-    try:
-        async with session.get(url, params=params, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return {"error": f"sorsa_v2 {resp.status}"}
-            data = await resp.json()
-    except Exception as e:
-        return {"error": str(e)}
-
-    tweets = data if isinstance(data, list) else data.get("tweets", [])
-    mentions = []
-    for t in tweets:
-        mentions.append({
-            "tweet_id": t.get("id"),
-            "author": (t.get("user") or {}).get("screen_name") or t.get("author"),
-            "content": t.get("text", ""),
-            "posted_at": t.get("created_at"),
-            "engagement": (t.get("favorite_count") or 0) + (t.get("retweet_count") or 0),
-            "url": f"https://x.com/i/status/{t.get('id')}",
-        })
-    return {
-        "query": query, "source": "sorsa_v2",
-        "mentions": mentions, "total_found": len(mentions),
     }
 
 

@@ -282,6 +282,19 @@ async def run_outcome_tracker_loop():
         await asyncio.sleep(60)
 
 
+async def run_virtuals_community_monitor():
+    """Polls Virtuals Twitter Community for ticker/contract mentions."""
+    try:
+        from virtuals_community_monitor import run_community_monitor
+        bot_token = os.environ["HERMES_TELEGRAM_BOT_TOKEN"]
+        user_chat_id = int(os.environ.get("HERMES_USER_CHAT_ID", "750774735"))
+        logger.info("Virtuals Community monitor: starting")
+        await run_community_monitor(bot_token, user_chat_id)
+    except Exception as e:
+        logger.exception(f"virtuals_community_monitor failed: {e}")
+        await asyncio.sleep(60)
+
+
 async def run_polymarket_monitor():
     logger.info("Polymarket monitor: TODO wire up")
     while True:
@@ -345,6 +358,7 @@ async def main():
         asyncio.create_task(run_telegram_groups_monitor(), name="telegram-groups"),
         asyncio.create_task(run_smart_money_active(), name="smart-money-active"),
         asyncio.create_task(run_outcome_tracker_loop(), name="outcome-tracker"),
+        asyncio.create_task(run_virtuals_community_monitor(), name="virtuals-community"),
         asyncio.create_task(run_polymarket_monitor(), name="polymarket"),
         asyncio.create_task(run_kalshi_monitor(), name="kalshi"),
         asyncio.create_task(run_convergence_engine(), name="convergence"),

@@ -180,6 +180,102 @@ async def fetch_article_body(session: aiohttp.ClientSession, handle: str,
     return ""
 
 
+async def check_cohort_amplification(session: aiohttp.ClientSession,
+                                       origin_handle: str, tweet_id: str,
+                                       all_mega_handles: list[str],
+                                       bot_token: str, user_chat_id: int,
+                                       delay_seconds: int = 180) -> None:
+    """After a HOT MEGA tweet, wait ~3min then check if other MEGA handles RT'd or quoted.
+
+    Cohort signal: when 2+ HOT/ALPHA handles converge on the same tweet within
+    minutes, it's coordinated narrative — much stronger than a single mention.
+
+    Uses /check-retweet (cheap targeted check) instead of /retweeters (paginated, expensive).
+    """
+    if not TWEETSCOUT_API_KEY or not tweet_id or not all_mega_handles:
+        return
+    try:
+        await asyncio.sleep(delay_seconds)
+        # Don't check the origin handle itself
+        check_handles = [h for h in all_mega_handles if h.lower() != origin_handle.lower()]
+        # Cap at 30 to limit cost
+        check_handles = check_handles[:30]
+
+        tweet_url = f"https://twitter.com/{origin_handle}/status/{tweet_id}"
+        headers = {"ApiKey": TWEETSCOUT_API_KEY, "Content-Type": "application/json"}
+
+        async def _check_one(h: str) -> tuple[str, str | None]:
+            """Check if handle h retweeted OR quote-tweeted the origin tweet.
+            Returns (handle, action) where action is 'rt'|'quote'|None."""
+            try:
+                async with session.post(
+                    f"{SORSA}/check-retweet",
+                    headers=headers,
+                    json={"tweet_link": tweet_url, "username": h},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        if d.get("retweet"):
+                            return (h, "rt")
+            except Exception:
+                pass
+            try:
+                async with session.post(
+                    f"{SORSA}/check-quoted",
+                    headers=headers,
+                    json={"tweet_link": tweet_url, "username": h},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        status = d.get("status")
+                        if status in ("quoted", "retweet"):
+                            return (h, "quote" if status == "quoted" else "rt")
+            except Exception:
+                pass
+            return (h, None)
+
+        # Run checks in parallel with mild concurrency
+        sem = asyncio.Semaphore(5)
+        async def _gated(h):
+            async with sem:
+                return await _check_one(h)
+
+        results = await asyncio.gather(*[_gated(h) for h in check_handles])
+        amplifiers = [(h, action) for h, action in results if action]
+
+        if not amplifiers:
+            logger.info(f"  cohort @{origin_handle}/{tweet_id}: no MEGA amplification")
+            return
+
+        # Build alert
+        lines = [f"🔗 *MEGA CHAIN on @{origin_handle}'s tweet*",
+                 f"  {tweet_url}",
+                 ""]
+        for h, action in amplifiers[:8]:
+            emoji = "🔁" if action == "rt" else "💬"
+            lines.append(f"  {emoji} @{h} ({'retweeted' if action == 'rt' else 'quoted'})")
+        if len(amplifiers) > 1:
+            lines.append("")
+            lines.append(f"_⚡ {len(amplifiers)} MEGA handles converged within ~3min — coordinated narrative_")
+        msg = "\n".join(lines)
+        try:
+            async with aiohttp.ClientSession() as s2:
+                await s2.post(
+                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                    json={"chat_id": user_chat_id, "text": msg,
+                          "parse_mode": "Markdown",
+                          "disable_web_page_preview": True},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+        except Exception as e:
+            logger.warning(f"cohort alert send failed: {e}")
+        logger.info(f"  cohort @{origin_handle}/{tweet_id}: {len(amplifiers)} amplifiers alerted")
+    except Exception as e:
+        logger.debug(f"check_cohort_amplification {origin_handle}/{tweet_id}: {e}")
+
+
 async def fetch_quote_tweets(session: aiohttp.ClientSession, handle: str,
                               tweet_id: str) -> list[dict]:
     """Fetch quote-tweets for a given tweet via Sorsa v3 /quotes.
@@ -396,6 +492,19 @@ async def _process_tweet(handle, tier, tweet_id, text, session, bot_token,
             check_kol_quote_engagement(session, handle, tweet_id, bot_token, user_chat_id),
             name=f"kol-quotes-{handle}-{tweet_id}",
         )
+        # Cohort detection: ~3min later check if other MEGA handles amplified.
+        # Uses /check-retweet + /check-quoted (cheap targeted checks).
+        try:
+            mega_handles = list(load_handles().keys())  # all HOT + ALPHA
+            asyncio.create_task(
+                check_cohort_amplification(
+                    session, handle, tweet_id, mega_handles,
+                    bot_token, user_chat_id, delay_seconds=180,
+                ),
+                name=f"cohort-{handle}-{tweet_id}",
+            )
+        except Exception as e:
+            logger.debug(f"cohort schedule failed: {e}")
 
     evm_addrs = list(set(EVM_RE.findall(text)))
     tickers = list(set(TICKER_RE.findall(text)))

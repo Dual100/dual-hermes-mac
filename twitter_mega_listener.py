@@ -147,6 +147,39 @@ async def enrich_tweet_with_quote(session: aiohttp.ClientSession, tweet_id: str)
         return ""
 
 
+async def fetch_article_body(session: aiohttp.ClientSession, handle: str,
+                              tweet_id: str) -> str:
+    """Fetch Twitter article (long-form) body via Sorsa v3 /article.
+
+    Triggered when tweet text is short (<100 chars) on HOT tier — KOLs sometimes
+    post articles where contracts/tickers are hidden in the article body, not
+    the 280-char tweet. Returns concatenated title+preview+body or empty string.
+    """
+    if not TWEETSCOUT_API_KEY or not tweet_id:
+        return ""
+    try:
+        url = f"https://twitter.com/{handle}/status/{tweet_id}"
+        async with session.post(
+            f"{SORSA}/article",
+            headers={"ApiKey": TWEETSCOUT_API_KEY, "Content-Type": "application/json"},
+            json={"tweet_link": url},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            if r.status != 200:
+                return ""
+            data = await r.json()
+            # Article shape: {title, preview_text, cover_image, ...}
+            parts = []
+            for k in ("title", "preview_text", "text", "body"):
+                v = data.get(k)
+                if isinstance(v, str) and v.strip():
+                    parts.append(v.strip())
+            return "\n".join(parts)
+    except Exception as e:
+        logger.debug(f"fetch_article_body {handle}/{tweet_id}: {e}")
+    return ""
+
+
 async def fetch_quote_tweets(session: aiohttp.ClientSession, handle: str,
                               tweet_id: str) -> list[dict]:
     """Fetch quote-tweets for a given tweet via Sorsa v3 /quotes.
@@ -347,6 +380,14 @@ async def _process_tweet(handle, tier, tweet_id, text, session, bot_token,
         if extra and len(extra) > len(text):
             text = extra
             logger.info(f"  @{handle}: enriched with quote text ({len(extra)} chars)")
+
+    # HOT tier: if tweet is short (likely a long-form article link), fetch article body.
+    # Long-form articles often contain $TICKER or 0x... that the headline drops.
+    if tier == "HOT" and tweet_id and len(text.strip()) < 100:
+        article_body = await fetch_article_body(session, handle, tweet_id)
+        if article_body and len(article_body) > 50:
+            text = f"{text}\n[ARTICLE]: {article_body}"
+            logger.info(f"  @{handle}: enriched with article body ({len(article_body)} chars)")
 
     # HOT tier only: schedule a 60s-delayed KOL quote-engagement check.
     # Quote-tweets are stronger engagement signal than retweets.

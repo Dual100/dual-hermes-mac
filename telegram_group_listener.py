@@ -874,7 +874,8 @@ async def _twitter_context_score(handle: str, session: aiohttp.ClientSession) ->
     """Fetch Twitter handle context to weight credibility/origin signals.
 
     Returns dict with:
-      followers_count, friends_count, account_age_days, verified, score_boost, reasons
+      followers, friends, age_days, verified, score_boost, reasons
+    Uses Sorsa v3 /info (fields: followers_count, followings_count, created_at).
     """
     if not handle:
         return {}

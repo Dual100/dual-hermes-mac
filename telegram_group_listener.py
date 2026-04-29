@@ -69,7 +69,9 @@ def _gem_quality_check(anatomy: dict, source: str = "") -> tuple:
     # Keep raw values to distinguish "stale data (None)" from "no movement (0)"
     pct1_raw = anatomy.get("price_change_1h")  # may be None
     pct24_raw = anatomy.get("price_change_24h")  # may be None
+    pct6_raw = anatomy.get("price_change_6h")
     pct1 = pct1_raw or 0  # safe for arithmetic comparisons
+    pct6 = pct6_raw or 0
     pct24 = pct24_raw or 0
     token_type = anatomy.get("_token_type", "memecoin")
 
@@ -86,18 +88,30 @@ def _gem_quality_check(anatomy: dict, source: str = "") -> tuple:
             mega_handles = ([m["handle"] for m in mega_search[:2]]
                             + [m["handle"] for m in (mega_mention.get("handles") or [])[:2]])
             sig_strs.append(f"🔥 MEMECOIN+HYPE (MEGA: {','.join(set(mega_handles))[:40]})")
-        # Pumping memecoin (>50% in 1h or >300% in 24h) = explosive momentum
-        # Use 0 default for pct1 if None (stale 1h data shouldn't block)
-        _p1 = pct1 or 0
-        if _p1 > 50 or pct24 > 300:
-            sig_strs.append(f"📈 MEMECOIN_PUMPING (1h={_p1:.0f}%, 24h={pct24:.0f}%)")
+        # Pumping memecoin: explosive momentum w/ guard against late-entry traps.
+        # Path A: 1h still pumping >50% — fresh momentum, always alpha
+        # Path B: 24h >300% AND not currently bleeding (pct1>0 or stale+pct6>-5)
+        # Real case: $CYB alerted at +2706% with pct1=None pct6=-27 → −14% in 30min
+        momentum_ok = pct1 > 0 or (pct1_raw is None and pct6 > -5)
+        if pct1 > 50:
+            sig_strs.append(f"📈 MEMECOIN_PUMPING (1h={pct1:.0f}%, 24h={pct24:.0f}%)")
+        elif pct24 > 300 and momentum_ok:
+            sig_strs.append(f"📈 MEMECOIN_PUMPING (24h={pct24:.0f}%, "
+                            f"1h={pct1:+.0f}%, 6h={pct6:+.0f}%)")
 
-    # CROSS-TYPE PUMPED PATH — token had explosive 24h move regardless of type.
+    # CROSS-TYPE PUMPED PATH — token had explosive 24h move AND still has momentum.
     # Catches cases where _classify_token_type guessed wrong (e.g., $🦄 UnicornFund
     # classified as "project" but +380% pump = clearly memecoin behavior).
-    # Requires decent score + small/mid cap + holders to filter rugs.
-    if (pct24 or 0) >= 200 and score >= 75 and 50_000 <= mcap <= 5_000_000 and holders >= 50:
-        sig_strs.append(f"🚀 PUMPED_24H ({pct24:.0f}%, mcap=${mcap/1000:.0f}K)")
+    # Momentum guard: pct1 > 0 OR (pct1 stale AND pct6 > -5%) to avoid late-entry.
+    # Real case: $CYB alerted at +2706% but 1h=-14% / 6h=-27% → late entry, lost 14%.
+    pumped_momentum_ok = (
+        pct1 > 0
+        or (pct1_raw is None and pct6 > -5)
+    )
+    if (pct24 >= 200 and score >= 75 and 50_000 <= mcap <= 5_000_000
+        and holders >= 50 and pumped_momentum_ok):
+        sig_strs.append(f"🚀 PUMPED_24H ({pct24:.0f}%, 1h={pct1:+.0f}%, "
+                        f"6h={pct6:+.0f}%, mcap=${mcap/1000:.0f}K)")
     # PROJECT trust path (Butler) — Virtuals ecosystem with team backing
     deep = anatomy.get("_deep_profile") or {}
     if token_type == "project":
@@ -125,13 +139,13 @@ def _gem_quality_check(anatomy: dict, source: str = "") -> tuple:
         handles = [m["handle"] for m in mega_m.get("handles", [])[:2]]
         sig_strs.append(f"MEGA_TWITTER({','.join(handles)})")
 
-    # (c) Decent score + healthy fundamentals (early gem signal).
-    # If 1h data is stale (None), fall back to checking 24h > 50% (still alpha-tier).
-    _p1_check = pct1 > 10 or (pct1_raw is None and pct24 > 50)
+    # (c) Decent score + healthy fundamentals + still has momentum.
+    # If 1h data is stale, only qualify if 6h is positive (avoid late-entry traps).
+    _p1_check = pct1 > 10 or (pct1_raw is None and pct24 > 50 and pct6 > -5)
     if not sig_strs and score >= 75 and mcap < 1_000_000 and holders >= 100 and _p1_check:
         _p1_str = f"{pct1:.0f}" if pct1_raw is not None else "—"
         sig_strs.append(f"HEALTHY_GEM(score={score}, mcap={mcap:,.0f}, holders={holders}, "
-                        f"1h={_p1_str}%, 24h={pct24:.0f}%)")
+                        f"1h={_p1_str}%, 6h={pct6:+.0f}%, 24h={pct24:.0f}%)")
 
     if sig_strs:
         return True, " + ".join(sig_strs)

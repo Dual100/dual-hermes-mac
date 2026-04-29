@@ -16,7 +16,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, List, Set
 
 import aiohttp
 from telethon import TelegramClient, events
@@ -1691,9 +1691,6 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
             evm_addrs = list(set(EVM_RE.findall(text)))
             tickers = list(set(TICKER_RE.findall(text)))
 
-            if not evm_addrs and not tickers:
-                return
-
             chat = await event.get_chat()
             sender = await event.get_sender()
             group_name = getattr(chat, "title", str(chat.id))
@@ -1701,7 +1698,38 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
             chat_username = getattr(chat, "username", None)
             msg_url = f"https://t.me/{chat_username}/{msg_id}" if chat_username else ""
 
-            logger.info(f"[{group_name}] @{sender_name}: {len(evm_addrs)} evm + {len(tickers)} tickers")
+            # LLM extraction for conversational posts (no $TICKER, no 0x).
+            # KOL groups often post calls like "this new agent from @creator is fire"
+            # — we'd miss those without this. Gated on length to avoid running LLM
+            # on reactions ("gm", "lfg", "🚀") and spam.
+            llm_terms: List[str] = []
+            if not evm_addrs and not tickers and len(text.strip()) >= 30:
+                try:
+                    async with aiohttp.ClientSession() as _llm_session:
+                        raw = await llm_extract_terms(text, _llm_session)
+                    if raw:
+                        # Anti-hallucination: terms must appear in source text
+                        src_lower = text.lower()
+                        import re as _re_check
+                        src_words = set(_re_check.findall(r"\b[a-z0-9]{2,}\b", src_lower))
+                        for t_term in raw:
+                            t_clean = (t_term or "").strip()
+                            if not t_clean:
+                                continue
+                            if t_clean.lower() in src_lower:
+                                llm_terms.append(t_clean)
+                                continue
+                            words = _re_check.findall(r"[a-z0-9]+", t_clean.lower())
+                            if words and all(w in src_words for w in words):
+                                llm_terms.append(t_clean)
+                except Exception as e:
+                    logger.debug(f"LLM extract for [{group_name}]: {e}")
+
+            if not evm_addrs and not tickers and not llm_terms:
+                return
+
+            logger.info(f"[{group_name}] @{sender_name}: {len(evm_addrs)} evm + "
+                        f"{len(tickers)} tickers + {len(llm_terms)} llm_terms")
 
             now = time.time()
             # Resolve ticker-only mentions (no EVM in msg) to addresses via DexScreener
@@ -1714,7 +1742,35 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
                             ticker_addrs.append((a, c, tk))
                 logger.info(f"  resolved {len(ticker_addrs)} ticker(s) to addresses")
 
-            targets = [(a, "ethereum", None) for a in evm_addrs] + ticker_addrs
+            # Resolve LLM-extracted terms (and their acronym/concat variants)
+            llm_addrs = []
+            if not evm_addrs and llm_terms:
+                import re as _re_llm
+                seen_terms: Set[str] = set()
+                async with aiohttp.ClientSession() as session:
+                    for term in llm_terms[:5]:
+                        expanded = [term]
+                        words = _re_llm.findall(r"[A-Za-z0-9]+", term)
+                        if len(words) >= 2:
+                            acronym = "".join(w[0] for w in words).upper()
+                            if 2 <= len(acronym) <= 8:
+                                expanded.append(acronym)
+                            concat = "".join(words).upper()
+                            if 3 <= len(concat) <= 20:
+                                expanded.append(concat)
+                        for ex in expanded:
+                            ex_up = ex.upper()
+                            if ex_up in seen_terms:
+                                continue
+                            seen_terms.add(ex_up)
+                            a, c = await resolve_ticker_to_address(ex, session)
+                            if a:
+                                llm_addrs.append((a, c, ex))
+                                break
+                if llm_addrs:
+                    logger.info(f"  resolved {len(llm_addrs)} LLM term(s) to addresses")
+
+            targets = [(a, "ethereum", None) for a in evm_addrs] + ticker_addrs + llm_addrs
             for addr, chain, ticker_src in targets:
                 key = addr.lower()
                 if cooldowns.get(key, 0) > now:

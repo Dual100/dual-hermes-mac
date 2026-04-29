@@ -84,8 +84,17 @@ def _gem_quality_check(anatomy: dict, source: str = "") -> tuple:
                             + [m["handle"] for m in (mega_mention.get("handles") or [])[:2]])
             sig_strs.append(f"🔥 MEMECOIN+HYPE (MEGA: {','.join(set(mega_handles))[:40]})")
         # Pumping memecoin (>50% in 1h or >300% in 24h) = explosive momentum
-        if pct1 > 50 or pct24 > 300:
-            sig_strs.append(f"📈 MEMECOIN_PUMPING (1h={pct1:.0f}%, 24h={pct24:.0f}%)")
+        # Use 0 default for pct1 if None (stale 1h data shouldn't block)
+        _p1 = pct1 or 0
+        if _p1 > 50 or pct24 > 300:
+            sig_strs.append(f"📈 MEMECOIN_PUMPING (1h={_p1:.0f}%, 24h={pct24:.0f}%)")
+
+    # CROSS-TYPE PUMPED PATH — token had explosive 24h move regardless of type.
+    # Catches cases where _classify_token_type guessed wrong (e.g., $🦄 UnicornFund
+    # classified as "project" but +380% pump = clearly memecoin behavior).
+    # Requires decent score + small/mid cap + holders to filter rugs.
+    if (pct24 or 0) >= 200 and score >= 75 and 50_000 <= mcap <= 5_000_000 and holders >= 50:
+        sig_strs.append(f"🚀 PUMPED_24H ({pct24:.0f}%, mcap=${mcap/1000:.0f}K)")
     # PROJECT trust path (Butler) — Virtuals ecosystem with team backing
     deep = anatomy.get("_deep_profile") or {}
     if token_type == "project":
@@ -113,9 +122,12 @@ def _gem_quality_check(anatomy: dict, source: str = "") -> tuple:
         handles = [m["handle"] for m in mega_m.get("handles", [])[:2]]
         sig_strs.append(f"MEGA_TWITTER({','.join(handles)})")
 
-    # (c) Decent score + healthy fundamentals (early gem signal)
-    if not sig_strs and score >= 75 and mcap < 1_000_000 and holders >= 100 and pct1 > 10:
-        sig_strs.append(f"HEALTHY_GEM(score={score}, mcap={mcap:,.0f}, holders={holders}, 1h={pct1:.0f}%)")
+    # (c) Decent score + healthy fundamentals (early gem signal).
+    # If pct1 unknown (None), fall back to checking pct24 > 50 (still alpha-tier).
+    _p1_check = (pct1 or 0) > 10 or (pct1 is None and (pct24 or 0) > 50)
+    if not sig_strs and score >= 75 and mcap < 1_000_000 and holders >= 100 and _p1_check:
+        sig_strs.append(f"HEALTHY_GEM(score={score}, mcap={mcap:,.0f}, holders={holders}, "
+                        f"1h={pct1 if pct1 is not None else '—'}%, 24h={pct24:.0f}%)")
 
     if sig_strs:
         return True, " + ".join(sig_strs)

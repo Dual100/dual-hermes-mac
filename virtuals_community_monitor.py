@@ -30,11 +30,21 @@ logger = logging.getLogger("hermes.community_monitor")
 VIRTUALS_COMMUNITY_ID = os.environ.get(
     "HERMES_VIRTUALS_COMMUNITY_ID", "1925691137571820005"
 )
-POLL_INTERVAL_SEC = int(os.environ.get("HERMES_COMMUNITY_POLL_SEC", "90"))
+# 5min poll — empirical analysis showed 0% of community posts contain 0xADDRESS
+# and 29% contain only already-known tickers. 90s poll wastes quota on chatter.
+POLL_INTERVAL_SEC = int(os.environ.get("HERMES_COMMUNITY_POLL_SEC", "300"))
 SORSA = "https://api.sorsa.io/v3"
 
 EVM_RE = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
 TICKER_RE = re.compile(r"\$([A-Z][A-Z0-9]{1,9})\b")
+
+# Tickers we already monitor heavily through other paths (Butler, virtuals_twitter_monitor,
+# auto-discovery). If a community post ONLY mentions these, it's chatter, not alpha.
+KNOWN_TICKERS_BLACKLIST = {
+    "VIRTUAL", "FACY", "OTTO", "SR", "AIXBT", "TIBBIR", "VADER",
+    "LINK", "HYPE", "XRP", "AAVE", "GOLD", "ETH", "BTC", "USDC", "USDT",
+    "SOL", "BASE", "DOGE", "PEPE", "WIF", "BONK",
+}
 
 STATE_FILE = Path(os.environ.get("HERMES_HOME", str(Path.home() / "DualHermes"))) / "data" / "virtuals_community_state.json"
 
@@ -96,8 +106,17 @@ async def _process_community_tweet(tweet: dict, bot_token: str, user_chat_id: in
     if not evm_addrs and not tickers:
         return
 
+    # Filter: if NO EVM and ALL tickers are already known/monitored, skip.
+    # Empirical: 29% of community tweets had only already-known tickers (chatter).
+    if not evm_addrs:
+        unknown_tickers = [t for t in tickers if t.upper() not in KNOWN_TICKERS_BLACKLIST]
+        if not unknown_tickers:
+            logger.debug(f"  @{author}: all tickers known ({tickers}) — skip")
+            return
+        tickers = unknown_tickers
+
     logger.info(f"[Virtuals Community] @{author} ({fc:,} fol): "
-                f"{len(evm_addrs)} evm + {len(tickers)} tickers")
+                f"{len(evm_addrs)} evm + {len(tickers)} tickers (filtered)")
 
     # Resolve tickers if no EVM
     targets: List[tuple] = [(a, "ethereum", None) for a in evm_addrs]

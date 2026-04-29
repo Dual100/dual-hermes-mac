@@ -595,6 +595,10 @@ _MEGA_MENTION_CACHE: Dict[str, tuple] = {}  # key -> (expires, result)
 
 _TWITTER_SEARCH_CACHE: Dict[str, tuple] = {}  # key -> (expires, result)
 
+# LLM message extraction cache — same conversational message in 1h window
+# returns cached terms instead of re-running LLM (cost guard).
+_LLM_MSG_CACHE: Dict[str, tuple] = {}  # md5(text) -> (expires, terms_list)
+
 # Global Sorsa rate-limit state — backs off when 403 hit
 _SORSA_BACKOFF_UNTIL: float = 0.0
 
@@ -1689,6 +1693,10 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
                 return
 
             evm_addrs = list(set(EVM_RE.findall(text)))
+            # Solana addresses: 32-44 base58 chars, often ending in "pump" (Pump.fun) or random
+            # Heuristic: standalone token-like string of 32-44 [1-9A-HJ-NP-Za-km-z]
+            sol_addrs_raw = re.findall(r"\b([1-9A-HJ-NP-Za-km-z]{32,44})\b", text)
+            sol_addrs = [s for s in sol_addrs_raw if not s.startswith("0x")]
             tickers = list(set(TICKER_RE.findall(text)))
 
             chat = await event.get_chat()
@@ -1698,56 +1706,59 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
             chat_username = getattr(chat, "username", None)
             msg_url = f"https://t.me/{chat_username}/{msg_id}" if chat_username else ""
 
-            # LLM extraction for conversational posts (no $TICKER, no 0x).
-            # Only fires when message looks like a CALL/SIGNAL — gating saves LLM
-            # cost on chat noise ("gm", "lfg", weather, jokes, banter).
+            # LLM extraction on ANY conversational content (no $TICKER, no 0x, no Solana).
+            # User wants: read everything substantive, not only call-signal — KOLs
+            # often discuss projects/teams without explicit triggers.
+            # Cost guard: per-message cache (1h TTL) so identical re-posts don't re-burn LLM.
             llm_terms: List[str] = []
             text_stripped = text.strip()
-            text_lower = text_stripped.lower()
-            # Call-signal keywords — message must contain at least 1 to trigger LLM
-            CALL_SIGNAL_RE = re.compile(
-                r"\b(launching|launched|deployed|deploying|live now|going live|"
-                r"calling|call|drop(ped|ping)?|sending|sent it|alpha|gem|"
-                r"fire|bullish|buying|bought|long|short(ing)?|"
-                r"new agent|new launch|just (out|live|deployed)|"
-                r"watch(ing)?|next(\s+\w+)?\s+(token|agent|launch)|"
-                r"about to|aping|aped|degen play)\b",
-                re.IGNORECASE,
-            )
-            has_mention = "@" in text_stripped
-            has_call_signal = bool(CALL_SIGNAL_RE.search(text_lower))
             should_run_llm = (
-                not evm_addrs and not tickers
+                not evm_addrs and not tickers and not sol_addrs
                 and len(text_stripped) >= 30
-                and (has_call_signal or has_mention)
             )
             if should_run_llm:
-                try:
-                    async with aiohttp.ClientSession() as _llm_session:
-                        raw = await llm_extract_terms(text, _llm_session)
-                    if raw:
-                        # Anti-hallucination: terms must appear in source text
-                        src_lower = text.lower()
-                        import re as _re_check
-                        src_words = set(_re_check.findall(r"\b[a-z0-9]{2,}\b", src_lower))
-                        for t_term in raw:
-                            t_clean = (t_term or "").strip()
-                            if not t_clean:
-                                continue
-                            if t_clean.lower() in src_lower:
-                                llm_terms.append(t_clean)
-                                continue
-                            words = _re_check.findall(r"[a-z0-9]+", t_clean.lower())
-                            if words and all(w in src_words for w in words):
-                                llm_terms.append(t_clean)
-                except Exception as e:
-                    logger.debug(f"LLM extract for [{group_name}]: {e}")
+                # Hash cache by normalized text — repeated messages skip LLM
+                import hashlib as _hashlib
+                _text_key = _hashlib.md5(text_stripped.lower().encode()).hexdigest()
+                _cached = _LLM_MSG_CACHE.get(_text_key)
+                if _cached and _cached[0] > time.time():
+                    llm_terms = list(_cached[1])
+                    logger.debug(f"  LLM cache hit ({len(llm_terms)} terms)")
+                else:
+                    try:
+                        async with aiohttp.ClientSession() as _llm_session:
+                            raw = await llm_extract_terms(text, _llm_session)
+                        if raw:
+                            # Anti-hallucination: terms must appear in source text
+                            src_lower = text.lower()
+                            import re as _re_check
+                            src_words = set(_re_check.findall(r"\b[a-z0-9]{2,}\b", src_lower))
+                            for t_term in raw:
+                                t_clean = (t_term or "").strip()
+                                if not t_clean:
+                                    continue
+                                if t_clean.lower() in src_lower:
+                                    llm_terms.append(t_clean)
+                                    continue
+                                words = _re_check.findall(r"[a-z0-9]+", t_clean.lower())
+                                if words and all(w in src_words for w in words):
+                                    llm_terms.append(t_clean)
+                        # Cache result for 1h (positive AND negative — even empty terms cached)
+                        _LLM_MSG_CACHE[_text_key] = (time.time() + 3600, list(llm_terms))
+                        # Bound cache
+                        if len(_LLM_MSG_CACHE) > 5000:
+                            _now_t = time.time()
+                            for k in [k for k, v in _LLM_MSG_CACHE.items() if v[0] <= _now_t]:
+                                _LLM_MSG_CACHE.pop(k, None)
+                    except Exception as e:
+                        logger.debug(f"LLM extract for [{group_name}]: {e}")
 
-            if not evm_addrs and not tickers and not llm_terms:
+            if not evm_addrs and not tickers and not llm_terms and not sol_addrs:
                 return
 
             logger.info(f"[{group_name}] @{sender_name}: {len(evm_addrs)} evm + "
-                        f"{len(tickers)} tickers + {len(llm_terms)} llm_terms")
+                        f"{len(sol_addrs)} sol + {len(tickers)} tickers + "
+                        f"{len(llm_terms)} llm_terms")
 
             now = time.time()
             # Resolve ticker-only mentions (no EVM in msg) to addresses via DexScreener
@@ -1788,7 +1799,8 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
                 if llm_addrs:
                     logger.info(f"  resolved {len(llm_addrs)} LLM term(s) to addresses")
 
-            targets = [(a, "ethereum", None) for a in evm_addrs] + ticker_addrs + llm_addrs
+            sol_targets = [(a, "solana", None) for a in sol_addrs]
+            targets = [(a, "ethereum", None) for a in evm_addrs] + sol_targets + ticker_addrs + llm_addrs
             for addr, chain, ticker_src in targets:
                 key = addr.lower()
                 if cooldowns.get(key, 0) > now:

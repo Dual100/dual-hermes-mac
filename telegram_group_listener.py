@@ -66,8 +66,11 @@ def _gem_quality_check(anatomy: dict, source: str = "") -> tuple:
     score = (anatomy.get("_decision") or {}).get("score", 0)
     mcap = anatomy.get("current_mcap") or 0
     holders = anatomy.get("holder_count") or 0
-    pct1 = anatomy.get("price_change_1h") or 0
-    pct24 = anatomy.get("price_change_24h") or 0
+    # Keep raw values to distinguish "stale data (None)" from "no movement (0)"
+    pct1_raw = anatomy.get("price_change_1h")  # may be None
+    pct24_raw = anatomy.get("price_change_24h")  # may be None
+    pct1 = pct1_raw or 0  # safe for arithmetic comparisons
+    pct24 = pct24_raw or 0
     token_type = anatomy.get("_token_type", "memecoin")
 
     # (a) Top-tier score auto-qualifies — exceptional quality
@@ -123,11 +126,12 @@ def _gem_quality_check(anatomy: dict, source: str = "") -> tuple:
         sig_strs.append(f"MEGA_TWITTER({','.join(handles)})")
 
     # (c) Decent score + healthy fundamentals (early gem signal).
-    # If pct1 unknown (None), fall back to checking pct24 > 50 (still alpha-tier).
-    _p1_check = (pct1 or 0) > 10 or (pct1 is None and (pct24 or 0) > 50)
+    # If 1h data is stale (None), fall back to checking 24h > 50% (still alpha-tier).
+    _p1_check = pct1 > 10 or (pct1_raw is None and pct24 > 50)
     if not sig_strs and score >= 75 and mcap < 1_000_000 and holders >= 100 and _p1_check:
+        _p1_str = f"{pct1:.0f}" if pct1_raw is not None else "—"
         sig_strs.append(f"HEALTHY_GEM(score={score}, mcap={mcap:,.0f}, holders={holders}, "
-                        f"1h={pct1 if pct1 is not None else '—'}%, 24h={pct24:.0f}%)")
+                        f"1h={_p1_str}%, 24h={pct24:.0f}%)")
 
     if sig_strs:
         return True, " + ".join(sig_strs)

@@ -29,7 +29,7 @@ TICKER_RE = re.compile(r"\$([A-Z][A-Z0-9]{1,10})\b")
 
 ALERT_THRESHOLD = int(os.environ.get("HERMES_ALERT_THRESHOLD", "75"))  # GEM ONLY mode (was 45)
 GEM_MODE = os.environ.get("HERMES_GEM_MODE", "1") == "1"
-GEM_DAILY_CAP = int(os.environ.get("HERMES_GEM_DAILY_CAP", "10"))
+GEM_DAILY_CAP = int(os.environ.get("HERMES_GEM_DAILY_CAP", "30"))
 COOLDOWN_SEC = int(os.environ.get("HERMES_TOKEN_COOLDOWN_SEC", "1800"))
 # Per-source mcap caps. Source label decides limit. None = unlimited.
 SOURCE_MCAP_CAPS = {

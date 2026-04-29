@@ -1699,11 +1699,29 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
             msg_url = f"https://t.me/{chat_username}/{msg_id}" if chat_username else ""
 
             # LLM extraction for conversational posts (no $TICKER, no 0x).
-            # KOL groups often post calls like "this new agent from @creator is fire"
-            # — we'd miss those without this. Gated on length to avoid running LLM
-            # on reactions ("gm", "lfg", "🚀") and spam.
+            # Only fires when message looks like a CALL/SIGNAL — gating saves LLM
+            # cost on chat noise ("gm", "lfg", weather, jokes, banter).
             llm_terms: List[str] = []
-            if not evm_addrs and not tickers and len(text.strip()) >= 30:
+            text_stripped = text.strip()
+            text_lower = text_stripped.lower()
+            # Call-signal keywords — message must contain at least 1 to trigger LLM
+            CALL_SIGNAL_RE = re.compile(
+                r"\b(launching|launched|deployed|deploying|live now|going live|"
+                r"calling|call|drop(ped|ping)?|sending|sent it|alpha|gem|"
+                r"fire|bullish|buying|bought|long|short(ing)?|"
+                r"new agent|new launch|just (out|live|deployed)|"
+                r"watch(ing)?|next(\s+\w+)?\s+(token|agent|launch)|"
+                r"about to|aping|aped|degen play)\b",
+                re.IGNORECASE,
+            )
+            has_mention = "@" in text_stripped
+            has_call_signal = bool(CALL_SIGNAL_RE.search(text_lower))
+            should_run_llm = (
+                not evm_addrs and not tickers
+                and len(text_stripped) >= 30
+                and (has_call_signal or has_mention)
+            )
+            if should_run_llm:
                 try:
                     async with aiohttp.ClientSession() as _llm_session:
                         raw = await llm_extract_terms(text, _llm_session)

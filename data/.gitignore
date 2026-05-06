@@ -1,0 +1,5 @@
+# Track only configuration; ignore runtime state by default
+*
+!.gitignore
+!monitored_groups.json
+!mega_handles.json

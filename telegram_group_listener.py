@@ -42,9 +42,24 @@ SOURCE_MCAP_CAPS = {
 DEFAULT_MCAP_CAP = int(os.environ.get("HERMES_MAX_MCAP_FOR_ALERT", "500000000"))
 HERMES_DATA_API_URL = os.environ.get("HERMES_DATA_API_URL", "").rstrip("/")
 HERMES_DATA_API_KEY = os.environ.get("HERMES_DATA_API_KEY", "")
+
+# Kill flag (2026-05-08) — checks Hetzner /kill-flags every 60s.
+# Dashboard buttons or `redis-cli SET flag:sorsa_disable 1` flip this.
+try:
+    from kill_flags_client import is_disabled as _is_kf_disabled, start_polling as _start_kf_polling
+except ImportError:
+    _is_kf_disabled = lambda f: os.environ.get("DISABLE_SORSA", "0") == "1"
+    _start_kf_polling = lambda: None
+
+def _sorsa_off() -> bool:
+    return _is_kf_disabled("sorsa_disable")
+def _telegram_off() -> bool:
+    return _is_kf_disabled("telegram_listener_disable")
+def _alerts_off() -> bool:
+    return _is_kf_disabled("all_alerts_disable")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "kimi-k2.5")
+LLM_MODEL = os.environ.get("LLM_MODEL", "kimi-k2")
 
 GROUPS_FILE = Path("data/monitored_groups.json")
 COOLDOWN_FILE = Path("data/listener_cooldowns.json")
@@ -544,7 +559,7 @@ async def _virtuals_deep_check(address: str, session: aiohttp.ClientSession) -> 
             pass
 
     twitter = out.get("twitter")
-    if twitter:
+    if twitter and not _sorsa_off():
         # Cross-ref Sorsa: is twitter followed by Virtuals team?
         try:
             sorsa_key = os.environ.get("TWEETSCOUT_API_KEY", "").strip('"')
@@ -651,6 +666,8 @@ async def _twitter_full_search(symbol: str, address: str, name: str,
       total_mentions, unique_authors, top_shillers, sample_tweets,
       mega_mentions, score_boost, reasons
     """
+    if _sorsa_off():
+        return {"total_mentions": 0, "unique_authors": 0, "score_boost": 0, "skipped": "disabled"}
     api_key = os.environ.get("TWEETSCOUT_API_KEY", "").strip('"')
     if not api_key:
         return {}
@@ -814,6 +831,8 @@ async def _mega_mention_check(symbol: str, address: str, session: aiohttp.Client
 
     Cached 5min — reduces Sorsa load when same token appears in multiple sources.
     """
+    if _sorsa_off():
+        return {}
     api_key = os.environ.get("TWEETSCOUT_API_KEY", "").strip('"')
     if not api_key or not (symbol or address):
         return {}
@@ -1061,38 +1080,52 @@ Tasks:
 4. Risk in 1 sentence.
 
 Answer concise, max 4 short lines."""
-    try:
-        url = f"{HERMES_DATA_API_URL}/llm/chat"
-        payload = {
-            "model": LLM_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 200,
-            "temperature": 0.3,
-        }
-        async with session.post(url, json=payload,
-                                headers={"Authorization": f"Bearer {HERMES_DATA_API_KEY}"},
-                                timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status != 200:
-                body = await r.text()
-                logger.warning(f"LLM call status={r.status} body={body[:200]}")
-                return ""
-            data = await r.json()
-            choices = data.get("choices") or []
-            if not choices:
-                logger.warning(f"LLM no choices: {str(data)[:200]}")
-                return ""
-            msg = choices[0].get("message") or {}
-            content = (msg.get("content") or "").strip()
-            if not content:
-                # kimi-k2.5 reasoning model puts content in reasoning_content
-                content = (msg.get("reasoning_content") or "").strip()
-            return content
-    except asyncio.TimeoutError:
-        logger.warning(f"LLM timeout after 15s (model={LLM_MODEL})")
-        return ""
-    except Exception as e:
-        logger.warning(f"LLM take exception: {type(e).__name__}: {e}")
-        return ""
+    # Fallback chain: kimi-k2.5 (primary, reasoning) → kimi-k2 → llama-4-maverick
+    # → llama-3.3-70b. kimi-k2.5 has chronic 15s timeouts on NVIDIA NIM, so we
+    # retry with faster non-reasoning models before giving up.
+    models = [LLM_MODEL, "kimi-k2", "llama-4-maverick", "llama-3.3-70b"]
+    seen = set(); chain = []
+    for m in models:
+        if m and m not in seen:
+            seen.add(m); chain.append(m)
+
+    url = f"{HERMES_DATA_API_URL}/llm/chat"
+    for i, model in enumerate(chain):
+        try:
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 200,
+                "temperature": 0.3,
+            }
+            t0 = asyncio.get_event_loop().time()
+            async with session.post(url, json=payload,
+                                    headers={"Authorization": f"Bearer {HERMES_DATA_API_KEY}"},
+                                    timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    logger.warning(f"LLM call ({model}) status={r.status} body={body[:120]}")
+                    continue
+                data = await r.json()
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+                msg = choices[0].get("message") or {}
+                content = (msg.get("content") or "").strip()
+                if not content:
+                    content = (msg.get("reasoning_content") or "").strip()
+                if content:
+                    if i > 0:
+                        logger.info(f"LLM ok via fallback #{i} ({model}, {asyncio.get_event_loop().time()-t0:.1f}s)")
+                    return content
+        except asyncio.TimeoutError:
+            logger.warning(f"LLM timeout 12s (model={model}) — trying next")
+            continue
+        except Exception as e:
+            logger.warning(f"LLM ({model}) {type(e).__name__}: {e} — trying next")
+            continue
+    logger.warning(f"LLM all models failed: {chain}")
+    return ""
 
 
 async def llm_extract_terms(text: str, session: aiohttp.ClientSession) -> list:

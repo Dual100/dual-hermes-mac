@@ -203,6 +203,59 @@ async def run_telegram_bot() -> None:
         # Trigger graceful shutdown
         os.kill(os.getpid(), signal.SIGTERM)
 
+    async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/hermes_restart — exit cleanly so launchd respawns us with fresh state."""
+        if not await require_auth(update):
+            return
+        await update.message.reply_text(
+            "♻️ *Restarting Hermes...*\n"
+            "Exiting now — launchd will respawn within 5s.\n"
+            "If you don't see ✅ within 30s, Hermes is not coming back.",
+            parse_mode="Markdown",
+        )
+        import sys
+        sys.exit(2)  # non-zero so launchd doesn't think this is intentional shutdown
+
+    async def kick_tailscale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/kick_tailscale — restart Tailscale daemon on the Mac."""
+        if not await require_auth(update):
+            return
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["sudo", "launchctl", "kickstart", "-k", "system/com.tailscale.tailscaled"],
+                capture_output=True, text=True, timeout=15,
+            )
+            ok = r.returncode == 0
+            await update.message.reply_text(
+                f"{'✅' if ok else '❌'} Tailscale kick: rc={r.returncode}\n"
+                f"stderr: {r.stderr[:200] if r.stderr else 'none'}"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed: {e}")
+
+    async def diagnose_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/diagnose — quick health check on Mac runtime."""
+        if not await require_auth(update):
+            return
+        import subprocess
+        import asyncio as _aio
+        lines = ["🔍 *Hermes diagnose*"]
+        try:
+            ts = subprocess.run(["tailscale", "status"], capture_output=True, text=True, timeout=5)
+            lines.append(f"Tailscale: {'up' if ts.returncode == 0 else 'down'}")
+        except Exception:
+            lines.append("Tailscale: error")
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://dualzero.duckdns.org/hermes/health",
+                                  timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    lines.append(f"Hetzner API: {r.status}")
+        except Exception as e:
+            lines.append(f"Hetzner API: ERROR ({str(e)[:60]})")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
     async def deny_anyone_else(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Catch-all — silently deny messages from non-allowed users."""
         if update.effective_user and update.effective_user.id not in ALLOWED_USER_IDS:
@@ -215,6 +268,9 @@ async def run_telegram_bot() -> None:
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("hermes_stop", stop_cmd))
+    app.add_handler(CommandHandler("hermes_restart", restart_cmd))
+    app.add_handler(CommandHandler("kick_tailscale", kick_tailscale_cmd))
+    app.add_handler(CommandHandler("diagnose", diagnose_cmd))
     app.add_handler(MessageHandler(filters.ALL, deny_anyone_else))
 
     logger.info(f"Telegram bot starting (allowed user: {HERMES_USER_CHAT_ID})")
@@ -268,6 +324,19 @@ async def run_smart_money_active():
         await run_listener(bot_token, user_chat_id)
     except Exception as e:
         logger.exception(f"smart_money_active failed: {e}")
+        await asyncio.sleep(30)
+
+
+async def run_smart_money_per_buy():
+    """Per-buy KOL investigation — every individual KOL buy triggers a token investigation."""
+    try:
+        from smart_money_per_buy import run_listener
+        bot_token = os.environ["HERMES_TELEGRAM_BOT_TOKEN"]
+        user_chat_id = int(os.environ.get("HERMES_USER_CHAT_ID", "750774735"))
+        logger.info("KOL per-buy: starting (poll /smart-money/recent-kol-buys)")
+        await run_listener(bot_token, user_chat_id)
+    except Exception as e:
+        logger.exception(f"smart_money_per_buy failed: {e}")
         await asyncio.sleep(30)
 
 
@@ -325,6 +394,51 @@ async def run_convergence_engine():
 # Main orchestrator
 # =============================================================================
 
+async def _alert_task_crash(name: str, exc: Exception, restarts: int) -> None:
+    """Alert via Telegram bot when a task crashes — so silent failures stop being silent."""
+    try:
+        from telegram import Bot
+        bot = Bot(token=os.environ.get("HERMES_TELEGRAM_BOT_TOKEN", ""))
+        chat = int(os.environ.get("HERMES_USER_CHAT_ID", "0"))
+        if chat and bot.token:
+            msg = (
+                f"⚠️ *Hermes task crashed*\n\n"
+                f"Task: `{name}`\n"
+                f"Restart attempt: #{restarts}\n"
+                f"Error: `{type(exc).__name__}: {str(exc)[:200]}`\n\n"
+                f"Auto-restarting in 30s. If you see this 5x in a row, "
+                f"the task itself has a bug — investigate."
+            )
+            await bot.send_message(chat_id=chat, text=msg, parse_mode="Markdown")
+    except Exception:
+        pass
+
+
+async def supervised_task(coro_factory, name: str, max_restarts: int = 100) -> None:
+    """Run a coroutine forever — restart on crash, alert on each crash.
+
+    coro_factory: zero-arg callable that returns a fresh coroutine each time.
+    Fixed the silent-crash issue from 2026-05-04 where smart-money WS task
+    died and asyncio.gather did not propagate, leaving Telegram bot alive
+    but polling dead.
+    """
+    restarts = 0
+    while restarts < max_restarts:
+        try:
+            logger.info(f"task[{name}] starting (restart #{restarts})")
+            await coro_factory()
+            logger.warning(f"task[{name}] returned without exception — restarting")
+        except asyncio.CancelledError:
+            logger.info(f"task[{name}] cancelled — exiting supervisor")
+            raise
+        except Exception as e:
+            logger.exception(f"task[{name}] crashed: {e}")
+            await _alert_task_crash(name, e, restarts + 1)
+        restarts += 1
+        await asyncio.sleep(30)
+    logger.error(f"task[{name}] exceeded {max_restarts} restarts — giving up")
+
+
 async def main():
     logger.info("=" * 50)
     logger.info("DualHermes Hunter — Mac process starting")
@@ -337,17 +451,38 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s)))
 
-    # Run all monitors + bot in parallel
+    # Start kill flags polling (Hetzner /kill-flags every 60s) — single source
+    # of truth for Sorsa/listener/cohort disable. Dashboard buttons flip Redis,
+    # this client picks up changes within 60s without restart.
+    try:
+        from kill_flags_client import start_polling as _start_kf
+        _start_kf()
+    except Exception as e:
+        logger.warning(f"kill_flags_client start failed: {e}")
+
+    # Each task wrapped in supervisor — auto-restart + Telegram alert on crash.
+    # No more silent failures.
+    # Reverse command queue — out-of-band control channel.
+    # If Tailscale dies but this task is alive, we can still recover via
+    # POST /commands/enqueue from Hetzner.
+    from command_executor import run_command_executor
+
+    task_specs = [
+        ("telegram-bot", run_telegram_bot),
+        ("twitter-mega", run_twitter_mega_monitor),
+        ("truthsocial", run_truthsocial_monitor),
+        ("telegram-groups", run_telegram_groups_monitor),
+        ("smart-money-active", run_smart_money_active),
+        ("smart-money-per-buy", run_smart_money_per_buy),
+        ("outcome-tracker", run_outcome_tracker_loop),
+        ("polymarket", run_polymarket_monitor),
+        ("kalshi", run_kalshi_monitor),
+        ("convergence", run_convergence_engine),
+        ("command-executor", run_command_executor),
+    ]
     tasks = [
-        asyncio.create_task(run_telegram_bot(), name="telegram-bot"),
-        asyncio.create_task(run_twitter_mega_monitor(), name="twitter-mega"),
-        asyncio.create_task(run_truthsocial_monitor(), name="truthsocial"),
-        asyncio.create_task(run_telegram_groups_monitor(), name="telegram-groups"),
-        asyncio.create_task(run_smart_money_active(), name="smart-money-active"),
-        asyncio.create_task(run_outcome_tracker_loop(), name="outcome-tracker"),
-        asyncio.create_task(run_polymarket_monitor(), name="polymarket"),
-        asyncio.create_task(run_kalshi_monitor(), name="kalshi"),
-        asyncio.create_task(run_convergence_engine(), name="convergence"),
+        asyncio.create_task(supervised_task(factory, name), name=name)
+        for name, factory in task_specs
     ]
 
     try:

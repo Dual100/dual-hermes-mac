@@ -28,6 +28,22 @@ FXTWITTER = "https://api.fxtwitter.com"
 SORSA = "https://api.sorsa.io/v3"
 TWEETSCOUT_API_KEY = os.environ.get("TWEETSCOUT_API_KEY", "").strip('"')
 
+# Kill flag (2026-05-08) — checks Hetzner /kill-flags every 60s.
+# Dashboard buttons or `redis-cli SET flag:sorsa_disable 1` flip this.
+# Falls back to legacy DISABLE_SORSA env var if API unreachable.
+try:
+    from kill_flags_client import is_disabled as _is_kf_disabled, start_polling as _start_kf_polling
+except ImportError:
+    _is_kf_disabled = lambda f: os.environ.get("DISABLE_SORSA", "0") == "1"
+    _start_kf_polling = lambda: None
+
+def _sorsa_off() -> bool:
+    return _is_kf_disabled("sorsa_disable")
+def _twitter_off() -> bool:
+    return _is_kf_disabled("twitter_listener_disable")
+def _cohort_off() -> bool:
+    return _is_kf_disabled("cohort_disable")
+
 HANDLES_FILE = Path("data/mega_handles.json")
 COOLDOWN_FILE = Path("data/twitter_cooldowns.json")
 STATE_FILE = Path("data/twitter_state.json")
@@ -76,8 +92,9 @@ async def fetch_count_and_latest(session: aiohttp.ClientSession, handle: str):
     """Returns (tweet_count, latest_tweet_id, latest_text) or (None, None, None).
 
     Strategy: FxTwitter (FREE) primary for count check + latest tweet ID detection.
-    Only fall back to Sorsa /user-tweets when FxTwitter fails AND we need rich text.
-    Sorsa is paid w/ tight quota — was burning 1M+ calls/day before this fix.
+    Sorsa fallback REMOVED — pre-2026-05-08 ran via Sorsa burning 1M+/day.
+    Now: only FxTwitter. If FxTwitter fails, we accept the brief gap and
+    rely on next poll cycle. Hetzner /twitter/quick-info as enrichment-only.
     """
     # PRIMARY: FxTwitter (free, no quota)
     try:
@@ -98,30 +115,6 @@ async def fetch_count_and_latest(session: aiohttp.ClientSession, handle: str):
                     return user.get("tweets") or 0, tweet_id, text
     except (aiohttp.ClientError, asyncio.TimeoutError):
         pass
-    # FALLBACK: Sorsa /user-tweets (paid — only when FxTwitter fails)
-    if TWEETSCOUT_API_KEY:
-        try:
-            async with session.post(f"{SORSA}/user-tweets",
-                                    headers={"ApiKey": TWEETSCOUT_API_KEY,
-                                             "Content-Type": "application/json"},
-                                    json={"username": handle, "count": 1},
-                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    tweets = data if isinstance(data, list) else data.get("tweets", [])
-                    if tweets:
-                        t = tweets[0]
-                        tweet_id = t.get("id") or t.get("id_str")
-                        text = (t.get("full_text") or t.get("text", "") or "").strip()
-                        for key in ("quoted_status", "retweeted_status", "quote", "quoted"):
-                            inner = t.get(key)
-                            if isinstance(inner, dict):
-                                inner_text = (inner.get("full_text") or inner.get("text", "") or "").strip()
-                                if inner_text and inner_text not in text:
-                                    text += f"\n[QUOTED]: {inner_text}"
-                        return 0, tweet_id, text
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            pass
     return None, None, None
 
 
@@ -155,7 +148,7 @@ async def fetch_article_body(session: aiohttp.ClientSession, handle: str,
     post articles where contracts/tickers are hidden in the article body, not
     the 280-char tweet. Returns concatenated title+preview+body or empty string.
     """
-    if not TWEETSCOUT_API_KEY or not tweet_id:
+    if _sorsa_off() or not TWEETSCOUT_API_KEY or not tweet_id:
         return ""
     try:
         url = f"https://twitter.com/{handle}/status/{tweet_id}"
@@ -192,7 +185,12 @@ async def check_cohort_amplification(session: aiohttp.ClientSession,
 
     Uses /check-retweet (cheap targeted check) instead of /retweeters (paginated, expensive).
     """
-    if not TWEETSCOUT_API_KEY or not tweet_id or not all_mega_handles:
+    # DISABLED 2026-05-08 — Sorsa burn protection.
+    # check-retweet + check-quoted = up to 60 Sorsa calls per cohort check.
+    # Re-enable later if needed via env DISABLE_HERMES_COHORT=0
+    if os.environ.get("DISABLE_HERMES_COHORT", "1") == "1":
+        return
+    if _sorsa_off() or not TWEETSCOUT_API_KEY or not tweet_id or not all_mega_handles:
         return
     try:
         await asyncio.sleep(delay_seconds)
@@ -283,7 +281,7 @@ async def fetch_quote_tweets(session: aiohttp.ClientSession, handle: str,
     Returns list of {username, followers_count, likes_count, full_text, ...}.
     Quote-tweets are stronger engagement signal than retweets (KOL wrote opinion).
     """
-    if not TWEETSCOUT_API_KEY or not tweet_id:
+    if _sorsa_off() or not TWEETSCOUT_API_KEY or not tweet_id:
         return []
     try:
         async with session.post(
@@ -358,25 +356,12 @@ async def check_kol_quote_engagement(session: aiohttp.ClientSession, handle: str
 
 
 async def fetch_latest_tweet(session: aiohttp.ClientSession, handle: str) -> dict | None:
-    """Get latest tweet text. Tries Sorsa first (richer), falls back to FxTwitter profile."""
-    if TWEETSCOUT_API_KEY:
-        try:
-            async with session.post(f"{SORSA}/user-tweets",
-                                    headers={"ApiKey": TWEETSCOUT_API_KEY,
-                                             "Content-Type": "application/json"},
-                                    json={"username": handle, "count": 1},
-                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    tweets = data if isinstance(data, list) else data.get("tweets", [])
-                    if tweets:
-                        t = tweets[0]
-                        return {
-                            "id": t.get("id") or t.get("id_str"),
-                            "text": t.get("full_text") or t.get("text", ""),
-                        }
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            pass
+    """Get latest tweet via FxTwitter (zero Sorsa burn).
+
+    Sorsa removed 2026-05-08 — was burning 1M+/day. FxTwitter has all we need
+    (id, text, quote). For richer enrichment (views, community_note, bookmarks)
+    use Hetzner /hermes/twitter/quick-tweet endpoint.
+    """
     try:
         async with session.get(f"{FXTWITTER}/{handle}",
                                timeout=aiohttp.ClientTimeout(total=8)) as r:

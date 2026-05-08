@@ -3,3 +3,5 @@ smart_money_wallets.json
 .secrets/
 *.session
 .env
+tests/__pycache__/
+.env.mac.*

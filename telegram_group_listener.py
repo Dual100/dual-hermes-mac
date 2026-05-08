@@ -70,6 +70,292 @@ _last_seen: Dict[str, float] = {}
 _gem_alerts_today: Dict[str, int] = {"date": "", "count": 0}
 
 
+# =============================================================================
+# Intel DB — capture every message + LLM analysis + first-mention tracking
+# Added 2026-05-08. SQLite local at data/outcomes.db (shared with outcome_tracker).
+# =============================================================================
+
+import sqlite3 as _sqlite3
+
+_INTEL_DB_PATH = Path(os.environ.get(
+    "HERMES_HOME", os.path.expanduser("~/hermes-mac"))) / "data" / "outcomes.db"
+
+_INTEL_INIT_SQL = """
+CREATE TABLE IF NOT EXISTS tg_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER, chat_name TEXT,
+    sender_id INTEGER, sender TEXT,
+    msg_id INTEGER, msg_url TEXT,
+    text TEXT,
+    ts INTEGER NOT NULL,
+    evm_addrs TEXT, sol_addrs TEXT, tickers TEXT,
+    projects TEXT,
+    intent TEXT, sentiment TEXT,
+    urgency INTEGER DEFAULT 0,
+    is_question INTEGER DEFAULT 0,
+    summary TEXT,
+    UNIQUE(chat_id, msg_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tg_msg_ts ON tg_messages(ts);
+CREATE INDEX IF NOT EXISTS idx_tg_msg_sender ON tg_messages(sender, ts);
+CREATE INDEX IF NOT EXISTS idx_tg_msg_chat ON tg_messages(chat_id, ts);
+
+CREATE TABLE IF NOT EXISTS project_mentions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    project_raw TEXT,
+    chat_id INTEGER, chat_name TEXT,
+    sender TEXT,
+    msg_id INTEGER, msg_url TEXT,
+    ts INTEGER NOT NULL,
+    intent TEXT,
+    is_first_ever INTEGER DEFAULT 0,
+    is_first_by_sender INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pm_proj_ts ON project_mentions(project, ts);
+CREATE INDEX IF NOT EXISTS idx_pm_sender_proj ON project_mentions(sender, project);
+"""
+
+_intel_db_initialized = False
+
+
+def _intel_db():
+    """Returns sqlite3 connection (autocommit). Creates tables on first call."""
+    global _intel_db_initialized
+    _INTEL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = _sqlite3.connect(str(_INTEL_DB_PATH), timeout=5.0, isolation_level=None)
+    if not _intel_db_initialized:
+        conn.executescript(_INTEL_INIT_SQL)
+        _intel_db_initialized = True
+    return conn
+
+
+async def analyze_message_intel(text: str, sender: str,
+                                  session: aiohttp.ClientSession) -> dict:
+    """One LLM call extracts full intel from a chat message.
+
+    Returns: {projects, intent, sentiment, urgency, is_question, summary}.
+    Falls back to empty dict on any error — caller must tolerate.
+    """
+    if not (HERMES_DATA_API_URL and HERMES_DATA_API_KEY) or not text.strip():
+        return {}
+    prompt = (
+        "Analyze this crypto trader chat message. Return ONLY a single JSON "
+        "object with these keys:\n"
+        "  projects: array of project names/tickers clearly mentioned (max 5)\n"
+        "  intent: one of announcement, question, info_share, shill, chat\n"
+        "  is_question: boolean\n"
+        "  urgency: integer 0-10 (10 = imminent launch / urgent alpha)\n"
+        "  sentiment: bullish, bearish, or neutral\n"
+        "  summary: one-line English summary, max 120 chars\n\n"
+        "Definitions:\n"
+        "- announcement: launch/update/news about a SPECIFIC project\n"
+        "- question: asking for info ('anyone tracking X?', 'wat is this')\n"
+        "- info_share: provides analysis/data/links\n"
+        "- shill: pump talk no substance\n"
+        "- chat: off-topic / generic\n\n"
+        "Rules: only include projects clearly mentioned (no inference). "
+        "Anti-hallucination: every project must appear in the text.\n\n"
+        f"AUTHOR: {sender}\nMESSAGE:\n{text[:1500]}\n\nJSON:"
+    )
+    try:
+        async with session.post(
+            f"{HERMES_DATA_API_URL}/llm/chat",
+            json={
+                "model": LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 250, "temperature": 0.1,
+            },
+            headers={"Authorization": f"Bearer {HERMES_DATA_API_KEY}"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            if r.status != 200:
+                return {}
+            data = await r.json()
+        content = ((data.get("choices") or [{}])[0]
+                   .get("message") or {}).get("content", "").strip()
+        if not content:
+            return {}
+        m = re.search(r"\{.*\}", content, re.S)
+        if not m:
+            return {}
+        intel = json.loads(m.group(0))
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError):
+        return {}
+    except Exception as e:
+        logger.debug(f"intel analyze error: {e}")
+        return {}
+
+    # Anti-hallucination: drop projects not in source text
+    projects_clean = []
+    text_lower = text.lower()
+    for p in (intel.get("projects") or [])[:5]:
+        if not isinstance(p, str):
+            continue
+        p = p.strip().lstrip("$").lstrip("#").strip()
+        if not p or len(p) > 40:
+            continue
+        if p.lower() in text_lower:
+            projects_clean.append(p)
+    intel["projects"] = projects_clean
+
+    # Validate other fields
+    if intel.get("intent") not in ("announcement", "question", "info_share", "shill", "chat"):
+        intel["intent"] = "chat"
+    if intel.get("sentiment") not in ("bullish", "bearish", "neutral"):
+        intel["sentiment"] = "neutral"
+    try:
+        intel["urgency"] = max(0, min(10, int(intel.get("urgency") or 0)))
+    except (TypeError, ValueError):
+        intel["urgency"] = 0
+    intel["is_question"] = bool(intel.get("is_question"))
+    intel["summary"] = (intel.get("summary") or "")[:200]
+
+    return intel
+
+
+def _normalize_project(p: str) -> str:
+    """Normalize project name for first-mention lookup."""
+    return (p or "").strip().lstrip("$").lstrip("#").lower()
+
+
+# Fast-alpha alert rate limiter (in-process). 8/hour ceiling.
+_fast_alert_log: list = []  # timestamps
+_FAST_ALERT_PER_HOUR = int(os.environ.get("HERMES_FAST_ALPHA_PER_HOUR", "8"))
+
+
+def _fast_alert_budget_ok() -> bool:
+    now = time.time()
+    cutoff = now - 3600
+    while _fast_alert_log and _fast_alert_log[0] < cutoff:
+        _fast_alert_log.pop(0)
+    return len(_fast_alert_log) < _FAST_ALERT_PER_HOUR
+
+
+def _fast_alert_register() -> None:
+    _fast_alert_log.append(time.time())
+
+
+def _format_fast_alpha_alert(group_name: str, sender_name: str, msg_url: str,
+                              first_ever: list, first_by_sender: list,
+                              intel: dict, raw_text: str) -> str:
+    """Lightweight Telegram alert for first-mention alpha. HTML-formatted."""
+    parts = ["<b>🆕 NEW PROJECT ALPHA</b>"]
+    if first_ever:
+        proj_str = ", ".join(html.escape(p) for p in first_ever[:5])
+        parts.append(f"📡 <b>First-ever mention</b>: {proj_str}")
+    elif first_by_sender:
+        proj_str = ", ".join(html.escape(p) for p in first_by_sender[:5])
+        parts.append(f"📡 <b>First by @{html.escape(sender_name)}</b>: {proj_str}")
+
+    intent = intel.get("intent") or "chat"
+    urgency = int(intel.get("urgency") or 0)
+    sentiment = intel.get("sentiment") or "neutral"
+    parts.append(
+        f"intent: {html.escape(intent)} | urgency: {urgency}/10 | "
+        f"sentiment: {html.escape(sentiment)}"
+    )
+
+    summary = (intel.get("summary") or "").strip()
+    if summary:
+        parts.append(f"💡 <i>{html.escape(summary[:200])}</i>")
+
+    quote = raw_text.strip().replace("\n", " ")[:240]
+    if quote:
+        parts.append(f"<blockquote>{html.escape(quote)}</blockquote>")
+
+    parts.append(f"📨 <b>{html.escape(group_name)}</b> · @{html.escape(sender_name)}")
+    if msg_url:
+        parts.append(f'<a href="{html.escape(msg_url)}">View message</a>')
+
+    return "\n".join(parts)
+
+
+def save_message_with_intel(msg_data: dict, intel: dict) -> tuple:
+    """Save raw message + intel; record project mentions with first-ever flags.
+
+    Returns (msg_db_id, first_ever_projects, first_by_sender_projects).
+    """
+    first_ever = []
+    first_by_sender = []
+    try:
+        conn = _intel_db()
+    except _sqlite3.Error as e:
+        logger.warning(f"intel_db open failed: {e}")
+        return (None, first_ever, first_by_sender)
+
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO tg_messages "
+            "(chat_id, chat_name, sender_id, sender, msg_id, msg_url, text, ts,"
+            " evm_addrs, sol_addrs, tickers, projects, intent, sentiment, urgency,"
+            " is_question, summary) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                msg_data["chat_id"], msg_data["chat_name"],
+                msg_data["sender_id"], msg_data["sender"],
+                msg_data["msg_id"], msg_data["msg_url"],
+                msg_data["text"], int(msg_data["ts"]),
+                json.dumps(msg_data.get("evm_addrs") or []),
+                json.dumps(msg_data.get("sol_addrs") or []),
+                json.dumps(msg_data.get("tickers") or []),
+                json.dumps(intel.get("projects") or []),
+                intel.get("intent") or "chat",
+                intel.get("sentiment") or "neutral",
+                int(intel.get("urgency") or 0),
+                1 if intel.get("is_question") else 0,
+                intel.get("summary") or "",
+            ),
+        )
+        msg_db_id = cur.lastrowid
+    except _sqlite3.Error as e:
+        logger.warning(f"intel_db insert msg failed: {e}")
+        conn.close()
+        return (None, first_ever, first_by_sender)
+
+    # Record project mentions
+    sender = msg_data["sender"]
+    for p_raw in (intel.get("projects") or []):
+        p_norm = _normalize_project(p_raw)
+        if not p_norm:
+            continue
+        try:
+            row1 = conn.execute(
+                "SELECT 1 FROM project_mentions WHERE project=? LIMIT 1",
+                (p_norm,),
+            ).fetchone()
+            is_first = row1 is None
+            row2 = conn.execute(
+                "SELECT 1 FROM project_mentions WHERE project=? AND sender=? LIMIT 1",
+                (p_norm, sender),
+            ).fetchone()
+            is_first_sender = row2 is None
+            conn.execute(
+                "INSERT INTO project_mentions "
+                "(project, project_raw, chat_id, chat_name, sender, msg_id, msg_url,"
+                " ts, intent, is_first_ever, is_first_by_sender) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    p_norm, p_raw,
+                    msg_data["chat_id"], msg_data["chat_name"],
+                    sender, msg_data["msg_id"], msg_data["msg_url"],
+                    int(msg_data["ts"]),
+                    intel.get("intent") or "chat",
+                    1 if is_first else 0,
+                    1 if is_first_sender else 0,
+                ),
+            )
+            if is_first:
+                first_ever.append(p_raw)
+            elif is_first_sender:
+                first_by_sender.append(p_raw)
+        except _sqlite3.Error as e:
+            logger.debug(f"project_mentions insert failed for {p_norm}: {e}")
+
+    conn.close()
+    return (msg_db_id, first_ever, first_by_sender)
+
+
 def _gem_quality_check(anatomy: dict, source: str = "") -> tuple:
     """Returns (passes, reason).
 
@@ -1766,55 +2052,84 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
             sender = await event.get_sender()
             group_name = getattr(chat, "title", str(chat.id))
             sender_name = getattr(sender, "username", None) or getattr(sender, "first_name", "?") or "?"
+            sender_id = getattr(sender, "id", 0) or 0
             chat_username = getattr(chat, "username", None)
             msg_url = f"https://t.me/{chat_username}/{msg_id}" if chat_username else ""
 
-            # LLM extraction on ANY conversational content (no $TICKER, no 0x, no Solana).
-            # User wants: read everything substantive, not only call-signal — KOLs
-            # often discuss projects/teams without explicit triggers.
-            # Cost guard: per-message cache (1h TTL) so identical re-posts don't re-burn LLM.
-            llm_terms: List[str] = []
+            # ─── INTELLIGENCE LAYER (2026-05-08) ────────────────────────────
+            # 1) ALWAYS capture raw message + entities to SQLite
+            # 2) Run LLM intel (projects/intent/urgency/sentiment) for substantive msgs
+            # 3) Detect first-ever-mention and first-by-sender from local DB
+            # ─────────────────────────────────────────────────────────────────
             text_stripped = text.strip()
-            should_run_llm = (
-                not evm_addrs and not tickers and not sol_addrs
-                and len(text_stripped) >= 30
-            )
-            if should_run_llm:
-                # Hash cache by normalized text — repeated messages skip LLM
+            llm_terms: List[str] = []
+            intel: dict = {}
+            first_ever: list = []
+            first_by_sender: list = []
+
+            if len(text_stripped) >= 20:
+                # Hash cache to avoid re-burning LLM on identical reposts
                 import hashlib as _hashlib
                 _text_key = _hashlib.md5(text_stripped.lower().encode()).hexdigest()
                 _cached = _LLM_MSG_CACHE.get(_text_key)
                 if _cached and _cached[0] > time.time():
-                    llm_terms = list(_cached[1])
-                    logger.debug(f"  LLM cache hit ({len(llm_terms)} terms)")
+                    intel = dict(_cached[1])
+                    logger.debug(f"  intel cache hit ({len(intel.get('projects', []))} projects)")
                 else:
                     try:
                         async with aiohttp.ClientSession() as _llm_session:
-                            raw = await llm_extract_terms(text, _llm_session)
-                        if raw:
-                            # Anti-hallucination: terms must appear in source text
-                            src_lower = text.lower()
-                            import re as _re_check
-                            src_words = set(_re_check.findall(r"\b[a-z0-9]{2,}\b", src_lower))
-                            for t_term in raw:
-                                t_clean = (t_term or "").strip()
-                                if not t_clean:
-                                    continue
-                                if t_clean.lower() in src_lower:
-                                    llm_terms.append(t_clean)
-                                    continue
-                                words = _re_check.findall(r"[a-z0-9]+", t_clean.lower())
-                                if words and all(w in src_words for w in words):
-                                    llm_terms.append(t_clean)
-                        # Cache result for 1h (positive AND negative — even empty terms cached)
-                        _LLM_MSG_CACHE[_text_key] = (time.time() + 3600, list(llm_terms))
-                        # Bound cache
-                        if len(_LLM_MSG_CACHE) > 5000:
-                            _now_t = time.time()
-                            for k in [k for k, v in _LLM_MSG_CACHE.items() if v[0] <= _now_t]:
-                                _LLM_MSG_CACHE.pop(k, None)
+                            intel = await analyze_message_intel(text, sender_name, _llm_session)
                     except Exception as e:
-                        logger.debug(f"LLM extract for [{group_name}]: {e}")
+                        logger.debug(f"analyze_message_intel for [{group_name}]: {e}")
+                        intel = {}
+                    _LLM_MSG_CACHE[_text_key] = (time.time() + 3600, intel)
+                    if len(_LLM_MSG_CACHE) > 5000:
+                        _now_t = time.time()
+                        for k in [k for k, v in _LLM_MSG_CACHE.items() if v[0] <= _now_t]:
+                            _LLM_MSG_CACHE.pop(k, None)
+
+                # llm_terms used by downstream resolver — projects from intel
+                llm_terms = list(intel.get("projects") or [])
+
+            # Persist raw + intel + project mentions
+            try:
+                _msg_data = {
+                    "chat_id": int(chat.id), "chat_name": group_name,
+                    "sender_id": int(sender_id), "sender": sender_name,
+                    "msg_id": int(msg_id), "msg_url": msg_url,
+                    "text": text[:4000], "ts": int(time.time()),
+                    "evm_addrs": evm_addrs, "sol_addrs": sol_addrs, "tickers": tickers,
+                }
+                _, first_ever, first_by_sender = save_message_with_intel(_msg_data, intel)
+            except Exception as e:
+                logger.debug(f"save_message_with_intel failed: {e}")
+
+            # NEW PROJECT alpha: first-ever mention + (announcement OR urgency>=7).
+            # Fires a fast small notification with raw context — info-as-gold UX.
+            # Rate-limited to 8/hour and skips during _alerts_off().
+            urgency = int(intel.get("urgency") or 0)
+            should_fast_alert = (
+                first_ever
+                and not _alerts_off()
+                and (intel.get("intent") == "announcement" or urgency >= 7)
+            )
+            if first_ever:
+                logger.info(
+                    f"  🆕 first-ever: {first_ever} by @{sender_name} "
+                    f"intent={intel.get('intent')} urg={urgency} — "
+                    f"{intel.get('summary', '')[:80]}"
+                )
+            if should_fast_alert and _fast_alert_budget_ok():
+                try:
+                    fa_text = _format_fast_alpha_alert(
+                        group_name, sender_name, msg_url,
+                        first_ever, first_by_sender, intel, text,
+                    )
+                    await send_alert(bot_token, user_chat_id, fa_text, keyboard=None)
+                    _fast_alert_register()
+                    logger.info(f"  📣 fast-alpha alert sent for {first_ever[:3]}")
+                except Exception as e:
+                    logger.debug(f"fast-alpha send failed: {e}")
 
             if not evm_addrs and not tickers and not llm_terms and not sol_addrs:
                 return

@@ -73,6 +73,147 @@ _gem_alerts_today: Dict[str, int] = {"date": "", "count": 0}
 
 
 # =============================================================================
+# Filters (2026-05-08): stop-list for spurious projects + bot sender list
+# Solana skipped from alert pipeline per user request (Base/ETH focus).
+# =============================================================================
+
+# Generic words / fragments LLM tends to extract as "projects" — block them.
+PROJECT_STOPLIST = {
+    # chains / native assets
+    "sol", "eth", "btc", "ton", "bnb", "matic", "avax", "weth", "wbtc",
+    "usdc", "usdt", "dai", "ethereum", "bitcoin", "solana", "base",
+    "arbitrum", "polygon", "optimism", "avalanche",
+    # generic words
+    "ban", "usa", "fun", "wen", "law", "glob", "sgm", "mae", "sat1",
+    "the", "and", "for", "you", "your", "this", "that",
+    # platform / category
+    "farcaster", "twitter", "telegram", "discord", "x.com",
+    "ai", "agent", "agents", "defi", "dao", "nft", "dex", "cex",
+    "cardano", "doge",
+    # ClawBank fragments
+    "claw", "bank", "clawn", "bankclaw", "bankclawn",
+    # alien narrative fragments
+    "aliens", "alien", "vitalien",
+}
+
+# Known bot sender handles — capture msgs but skip fast-alpha + first-ever flagging.
+# Bots post structured alerts which trigger LLM but aren't human-curated alpha.
+BOT_SENDERS_LOWER = {
+    "bigwalleteth", "livonewpairs", "degenseals", "maestrosdegen",
+    "powsgemcalls", "ryoshigamble", "gabbenscalls", "chrisalphacalls",
+    "neocallss", "maythousdegens", "metacaller", "ethvolumespike",
+    "shyroshigambles", "thedonsdegens", "thedonscalls",
+    "danncryptn", "dannycrypton", "marketmomentumcharts",
+    "iceshouseofdegen", "houseofdegeneracy", "robocalls", "boltzcalls",
+    "crowndegenethbase", "engineercalls", "x666calls", "theeyetg",
+    "marekdegen", "mintsmooners", "dexgemstg", "lyxesdegen",
+    "nomstradejournal",
+}
+
+
+def _is_bot_sender(sender: str) -> bool:
+    return (sender or "").lower() in BOT_SENDERS_LOWER
+
+
+def _filter_projects(projects: list) -> list:
+    """Drop generic stoplist words + tiny fragments."""
+    out = []
+    for p in (projects or []):
+        if not isinstance(p, str):
+            continue
+        norm = p.strip().lstrip("$").lstrip("#").strip().lower()
+        if not norm or len(norm) < 3 or norm in PROJECT_STOPLIST:
+            continue
+        out.append(p)
+    return out
+
+
+# Coordinated pump detector — fires when 2+ DISTINCT non-bot senders post the
+# same project with urgency >= 6 within a 5-min window.
+_PUMP_ALERT_FIRED: dict = {}  # {project_lower: ts_fired} → 30min cooldown
+_PUMP_COOLDOWN_SEC = 1800
+
+
+def _check_coordinated_pump(project: str, ts_now: int) -> dict:
+    """Look back 5 minutes in project_mentions for the same project.
+    Returns {triggered: bool, senders: [..], chats: [..], window_msgs: [..]}.
+    """
+    if not project or len(project) < 3 or project.lower() in PROJECT_STOPLIST:
+        return {"triggered": False}
+    proj_norm = project.lower()
+    last = _PUMP_ALERT_FIRED.get(proj_norm, 0)
+    if ts_now - last < _PUMP_COOLDOWN_SEC:
+        return {"triggered": False}
+
+    try:
+        conn = _intel_db()
+        rows = conn.execute(
+            "SELECT pm.sender, pm.chat_name, pm.msg_url, pm.ts, "
+            "       (SELECT urgency FROM tg_messages tm "
+            "        WHERE tm.chat_id=pm.chat_id AND tm.msg_id=pm.msg_id LIMIT 1) as urgency "
+            "FROM project_mentions pm "
+            "WHERE pm.project = ? AND pm.ts >= ? "
+            "ORDER BY pm.ts DESC LIMIT 50",
+            (proj_norm, ts_now - 300),
+        ).fetchall()
+        conn.close()
+    except _sqlite3.Error:
+        return {"triggered": False}
+
+    senders_set = set()
+    senders_filtered = []
+    chats = set()
+    msgs = []
+    for sender, chat, url, ts, urg in rows:
+        if _is_bot_sender(sender or ""):
+            continue
+        urg = urg or 0
+        if urg < 6:
+            continue
+        senders_set.add(sender)
+        chats.add(chat)
+        msgs.append({"sender": sender, "chat": chat, "url": url, "ts": ts, "urg": urg})
+        if sender not in [m["sender"] for m in senders_filtered]:
+            senders_filtered.append(m if False else {"sender": sender, "chat": chat, "ts": ts, "urg": urg, "url": url})
+
+    if len(senders_set) < 2:
+        return {"triggered": False}
+
+    _PUMP_ALERT_FIRED[proj_norm] = ts_now
+    return {
+        "triggered": True,
+        "project": project,
+        "senders": list(senders_set),
+        "chats": list(chats),
+        "window_msgs": msgs[:8],
+    }
+
+
+def _format_pump_alert(detection: dict) -> str:
+    """Format coordinated pump telegram alert."""
+    proj = html.escape(detection["project"])
+    parts = [f"<b>🚨 COORDINATED PUMP DETECTED — ${proj}</b>"]
+    senders = detection["senders"]
+    chats = detection["chats"]
+    parts.append(
+        f"📢 {len(senders)} senders across {len(chats)} group(s) in &lt;5min "
+        f"with urgency≥6"
+    )
+    parts.append(f"<b>Senders:</b> {', '.join(html.escape(s) for s in senders[:6])}")
+    parts.append(f"<b>Groups:</b> {', '.join(html.escape(c) for c in chats[:4])}")
+    parts.append("")
+    parts.append("<b>Recent messages:</b>")
+    for m in detection["window_msgs"][:5]:
+        url = m.get("url") or ""
+        sender = html.escape(m.get("sender", "?"))
+        chat = html.escape(m.get("chat", "?"))
+        urg = m.get("urg", 0)
+        link = f' <a href="{html.escape(url)}">↗</a>' if url else ""
+        parts.append(f"  • [@{sender}] in [{chat}] urg={urg}{link}")
+    return "\n".join(parts)
+
+
+# =============================================================================
 # Intel DB — capture every message + LLM analysis + first-mention tracking
 # Added 2026-05-08. SQLite local at data/outcomes.db (shared with outcome_tracker).
 # =============================================================================
@@ -199,7 +340,8 @@ async def analyze_message_intel(text: str, sender: str,
             continue
         if p.lower() in text_lower:
             projects_clean.append(p)
-    intel["projects"] = projects_clean
+    # Drop generic words that LLM extracts as "projects" but aren't useful signals
+    intel["projects"] = _filter_projects(projects_clean)
 
     # Validate other fields
     if intel.get("intent") not in ("announcement", "question", "info_share", "shill", "chat"):
@@ -2107,15 +2249,16 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
                 logger.debug(f"save_message_with_intel failed: {e}")
 
             # NEW PROJECT alpha: first-ever mention + (announcement OR urgency>=7).
-            # Fires a fast small notification with raw context — info-as-gold UX.
-            # Rate-limited to 8/hour and skips during _alerts_off().
+            # Skip bot senders — they post structured content, not human alpha.
             urgency = int(intel.get("urgency") or 0)
+            sender_is_bot = _is_bot_sender(sender_name)
             should_fast_alert = (
                 first_ever
+                and not sender_is_bot
                 and not _alerts_off()
                 and (intel.get("intent") == "announcement" or urgency >= 7)
             )
-            if first_ever:
+            if first_ever and not sender_is_bot:
                 logger.info(
                     f"  🆕 first-ever: {first_ever} by @{sender_name} "
                     f"intent={intel.get('intent')} urg={urgency} — "
@@ -2133,8 +2276,30 @@ async def run_listener(client: TelegramClient, bot_token: str, user_chat_id: int
                 except Exception as e:
                     logger.debug(f"fast-alpha send failed: {e}")
 
-            if not evm_addrs and not tickers and not llm_terms and not sol_addrs:
+            # Coordinated pump check — fire when 2+ non-bot senders post the same
+            # project with urgency>=6 within 5 min. Cooldown 30min per project.
+            if not sender_is_bot and not _alerts_off() and urgency >= 6:
+                ts_now = int(time.time())
+                for proj in (intel.get("projects") or [])[:5]:
+                    detection = _check_coordinated_pump(proj, ts_now)
+                    if detection.get("triggered"):
+                        try:
+                            pump_text = _format_pump_alert(detection)
+                            await send_alert(bot_token, user_chat_id, pump_text, keyboard=None)
+                            logger.info(
+                                f"  🚨 COORDINATED PUMP fired: {proj} "
+                                f"({len(detection['senders'])} senders, "
+                                f"{len(detection['chats'])} chats)"
+                            )
+                        except Exception as e:
+                            logger.debug(f"pump alert send failed: {e}")
+                        break  # one pump alert per message is enough
+
+            # Skip Solana from token resolution pipeline (Base/ETH focus per user).
+            # Still capture msgs + intel above — only the alert pipeline ignores SOL.
+            if not evm_addrs and not tickers and not llm_terms:
                 return
+            sol_addrs = []  # don't include in targets
 
             logger.info(f"[{group_name}] @{sender_name}: {len(evm_addrs)} evm + "
                         f"{len(sol_addrs)} sol + {len(tickers)} tickers + "

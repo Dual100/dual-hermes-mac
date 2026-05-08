@@ -59,7 +59,9 @@ def _alerts_off() -> bool:
     return _is_kf_disabled("all_alerts_disable")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "kimi-k2")
+# llama-4-maverick: lower variance than kimi-k2, same ~1.5s latency,
+# /llm/chat falls back to Groq llama-3.3-70b on NVIDIA 429/5xx automatically.
+LLM_MODEL = os.environ.get("LLM_MODEL", "llama-4-maverick")
 
 GROUPS_FILE = Path("data/monitored_groups.json")
 COOLDOWN_FILE = Path("data/listener_cooldowns.json")

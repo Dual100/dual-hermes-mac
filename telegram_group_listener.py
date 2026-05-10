@@ -497,7 +497,73 @@ def save_message_with_intel(msg_data: dict, intel: dict) -> tuple:
             logger.debug(f"project_mentions insert failed for {p_norm}: {e}")
 
     conn.close()
+
+    # Dual-write to Hetzner Postgres via Hermes API (best-effort, never blocks)
+    # Industry-standard pattern: SQLite local = source of truth + Postgres central
+    # for cross-machine queries (trending_token_watcher reads Postgres directly).
+    try:
+        _dual_write_pg_async(msg_data, intel, first_ever, first_by_sender)
+    except Exception as e:
+        logger.debug(f"pg dual-write fail: {e}")
+
     return (msg_db_id, first_ever, first_by_sender)
+
+
+# Pool of background pg-dual-write tasks (fire-and-forget)
+_PG_TASKS: set = set()
+
+
+def _dual_write_pg_async(msg_data: dict, intel: dict,
+                          first_ever: list, first_by_sender: list) -> None:
+    """Schedule background HTTP POST to Hermes API with the message + mentions.
+
+    Fire-and-forget — does NOT block listener. SQLite local already saved.
+    """
+    if not (HERMES_DATA_API_URL and HERMES_DATA_API_KEY):
+        return
+    payload = {
+        "msg": {
+            **msg_data,
+            "projects": intel.get("projects") or [],
+            "intent": intel.get("intent") or "chat",
+            "sentiment": intel.get("sentiment") or "neutral",
+            "urgency": int(intel.get("urgency") or 0),
+            "is_question": bool(intel.get("is_question")),
+            "summary": intel.get("summary") or "",
+        },
+        "mentions": [
+            {
+                "project": _normalize_project(p),
+                "project_raw": p,
+                "intent": intel.get("intent") or "chat",
+                "is_first_ever": p in first_ever,
+                "is_first_by_sender": p in first_by_sender,
+            }
+            for p in (intel.get("projects") or [])
+        ],
+    }
+
+    async def _do():
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{HERMES_DATA_API_URL}/tg-intel/insert-message",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {HERMES_DATA_API_KEY}"},
+                    timeout=aiohttp.ClientTimeout(total=4),
+                ) as r:
+                    if r.status >= 400:
+                        logger.debug(f"pg dual-write HTTP {r.status}")
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass  # silent — SQLite already saved
+
+    try:
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(_do())
+        _PG_TASKS.add(task)
+        task.add_done_callback(_PG_TASKS.discard)
+    except Exception:
+        pass
 
 
 def _gem_quality_check(anatomy: dict, source: str = "") -> tuple:

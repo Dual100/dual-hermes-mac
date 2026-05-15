@@ -150,7 +150,11 @@ def _check_coordinated_pump(project: str, ts_now: int) -> dict:
         rows = conn.execute(
             "SELECT pm.sender, pm.chat_name, pm.msg_url, pm.ts, "
             "       (SELECT urgency FROM tg_messages tm "
-            "        WHERE tm.chat_id=pm.chat_id AND tm.msg_id=pm.msg_id LIMIT 1) as urgency "
+            "        WHERE tm.chat_id=pm.chat_id AND tm.msg_id=pm.msg_id LIMIT 1) as urgency, "
+            "       (SELECT narrative_strength FROM tg_messages tm "
+            "        WHERE tm.chat_id=pm.chat_id AND tm.msg_id=pm.msg_id LIMIT 1) as narr_str, "
+            "       (SELECT narrative_themes FROM tg_messages tm "
+            "        WHERE tm.chat_id=pm.chat_id AND tm.msg_id=pm.msg_id LIMIT 1) as narr_themes "
             "FROM project_mentions pm "
             "WHERE pm.project = ? AND pm.ts >= ? "
             "ORDER BY pm.ts DESC LIMIT 50",
@@ -161,10 +165,11 @@ def _check_coordinated_pump(project: str, ts_now: int) -> dict:
         return {"triggered": False}
 
     senders_set = set()
-    senders_filtered = []
     chats = set()
     msgs = []
-    for sender, chat, url, ts, urg in rows:
+    max_narr_strength = 0
+    has_specific_theme = False
+    for sender, chat, url, ts, urg, narr_str, narr_themes in rows:
         if _is_bot_sender(sender or ""):
             continue
         urg = urg or 0
@@ -172,12 +177,28 @@ def _check_coordinated_pump(project: str, ts_now: int) -> dict:
             continue
         senders_set.add(sender)
         chats.add(chat)
-        msgs.append({"sender": sender, "chat": chat, "url": url, "ts": ts, "urg": urg})
-        if sender not in [m["sender"] for m in senders_filtered]:
-            senders_filtered.append(m if False else {"sender": sender, "chat": chat, "ts": ts, "urg": urg, "url": url})
+        msgs.append({"sender": sender, "chat": chat, "url": url, "ts": ts, "urg": urg,
+                     "narr_strength": narr_str or 0})
+        if (narr_str or 0) > max_narr_strength:
+            max_narr_strength = narr_str or 0
+        if narr_themes:
+            try:
+                themes = json.loads(narr_themes) if isinstance(narr_themes, str) else (narr_themes or [])
+                # crypto_culture alone is generic shill-talk; require something more specific
+                specific = [t for t in themes if t and t != "crypto_culture"]
+                if specific:
+                    has_specific_theme = True
+            except Exception:
+                pass
 
     if len(senders_set) < 2:
         return {"triggered": False}
+
+    # Narrative gate — block generic-only pumps (saved 2026-05-15 after $Viruscoin
+    # noise alert with narrative_strength=40 + crypto_culture-only themes).
+    min_narr = int(os.getenv("HERMES_PUMP_MIN_NARR_STRENGTH", "50"))
+    if max_narr_strength < min_narr and not has_specific_theme:
+        return {"triggered": False, "skipped_reason": "low_narrative"}
 
     _PUMP_ALERT_FIRED[proj_norm] = ts_now
     return {
@@ -186,6 +207,8 @@ def _check_coordinated_pump(project: str, ts_now: int) -> dict:
         "senders": list(senders_set),
         "chats": list(chats),
         "window_msgs": msgs[:8],
+        "max_narr_strength": max_narr_strength,
+        "has_specific_theme": has_specific_theme,
     }
 
 
